@@ -92,27 +92,39 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   }
 
   if (event.type === 'checkout.session.completed') {
-    const session       = event.data.object;
-    const { paymentId } = session.metadata || {};
-    const depositAmount = (session.amount_total || 0) / 100;
-    const today = new Date().toLocaleDateString('en-US', {
-      year: 'numeric', month: 'long', day: 'numeric',
-    });
+    const session  = event.data.object;
+    const meta     = session.metadata || {};
+    const today    = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 
-    if (paymentId) {
+    // ── TRYOUT FEE PAYMENT ──
+    if (meta.type === 'tryout' && meta.regId) {
       try {
-        const payment = await PlayerPayment.findById(paymentId);
+        await TryoutRegistration.findByIdAndUpdate(meta.regId, {
+          payment_status: 'Paid',
+          payment_date:   today,
+        });
+        console.log('Tryout fee recorded for regId=' + meta.regId);
+      } catch (err) {
+        console.error('Error updating tryout registration after Stripe webhook:', err);
+      }
+    }
+
+    // ── PLAYER DEPOSIT PAYMENT ──
+    if (meta.paymentId) {
+      const depositAmount = (session.amount_total || 0) / 100;
+      try {
+        const payment = await PlayerPayment.findById(meta.paymentId);
         if (payment && !payment.deposit_paid) {
           const newBalance = Math.max(0, payment.total_fee - depositAmount);
           const newStatus  = newBalance <= 0 ? 'Paid' : 'Partial';
-          await PlayerPayment.findByIdAndUpdate(paymentId, {
+          await PlayerPayment.findByIdAndUpdate(meta.paymentId, {
             deposit_paid:      true,
             deposit_paid_date: today,
             amount_paid:       depositAmount,
             balance:           newBalance,
             status:            newStatus,
           });
-          console.log('Stripe deposit recorded for paymentId=' + paymentId);
+          console.log('Stripe deposit recorded for paymentId=' + meta.paymentId);
         }
       } catch (err) {
         console.error('Error updating payment record after Stripe webhook:', err);
@@ -173,22 +185,27 @@ const tryoutSchema = new mongoose.Schema({
 tryoutSchema.index({ coach_id: 1 });
 
 const tryoutRegistrationSchema = new mongoose.Schema({
-  coach_id:     { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
-  completed_by: { type: String, default: '' },
-  name:         { type: String, default: '' },
-  address:      { type: String, default: '' },
-  city:         { type: String, default: '' },
-  state:        { type: String, default: '' },
-  zip:          { type: String, default: '' },
-  cell:         { type: String, default: '' },
-  email:        { type: String, default: '' },
-  player_name:  { type: String, default: '' },
-  age:          { type: String, default: '' },
-  dob:          { type: String, default: '' },
-  hw:           { type: String, default: '' },
-  pos1:         { type: String, default: '' },
-  pos2:         { type: String, default: '' },
-  tryout_date:  { type: String, default: '' },
+  coach_id:          { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
+  completed_by:      { type: String, default: '' },
+  name:              { type: String, default: '' },
+  address:           { type: String, default: '' },
+  city:              { type: String, default: '' },
+  state:             { type: String, default: '' },
+  zip:               { type: String, default: '' },
+  cell:              { type: String, default: '' },
+  email:             { type: String, default: '' },
+  player_name:       { type: String, default: '' },
+  age:               { type: String, default: '' },
+  dob:               { type: String, default: '' },
+  hw:                { type: String, default: '' },
+  pos1:              { type: String, default: '' },
+  pos2:              { type: String, default: '' },
+  tryout_date:       { type: String, default: '' },
+  tryout_fee:        { type: String, default: 'Free' },
+  tryout_fee_amount: { type: Number, default: 0 },
+  payment_status:    { type: String, default: 'Free' }, // 'Free' | 'Pending' | 'Paid'
+  payment_date:      { type: String, default: '' },
+  stripe_session_id: { type: String, default: '' },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 tryoutRegistrationSchema.index({ coach_id: 1 });
 
@@ -980,7 +997,33 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
 app.get('/api/coach/player-payments', requireAuth, async (req, res) => {
   try {
     const data = await PlayerPayment.find({ coach_id: req.coachId }).sort({ created_at: -1 });
-    res.json({ payments: data || [] });
+
+    // Enrich each payment record with full player info from the Player collection
+    const enriched = await Promise.all(data.map(async p => {
+      const obj = p.toObject();
+      if (p.player_id) {
+        try {
+          const player = await Player.findById(p.player_id)
+            .select('name email cell city state position jersey grad_year hw');
+          if (player) {
+            obj.player_info = {
+              name:     player.name      || '',
+              email:    player.email     || '',
+              cell:     player.cell      || '',
+              city:     player.city      || '',
+              state:    player.state     || '',
+              position: player.position  || '',
+              jersey:   player.jersey    || '',
+              gradYear: player.grad_year || '',
+              hw:       player.hw        || '',
+            };
+          }
+        } catch(_) {}
+      }
+      return obj;
+    }));
+
+    res.json({ payments: enriched });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -1338,13 +1381,28 @@ app.post('/api/teams/:id/tryout-registrations', async (req, res) => {
             playerName, age, dob, hw, pos1, pos2, tryoutDate } = req.body;
     if (!name || !playerName) return res.status(400).json({ message: 'Name and player name are required' });
 
+    // Look up the tryout fee for this coach + date
+    let tryoutFeeStr = 'Free';
+    let tryoutFeeAmt = 0;
+    if (tryoutDate) {
+      const tryout = await Tryout.findOne({ coach_id: req.params.id, date: tryoutDate });
+      if (tryout && tryout.fee && tryout.fee !== 'Free') {
+        tryoutFeeStr = tryout.fee;
+        tryoutFeeAmt = parseFloat(tryout.fee.replace(/[^0-9.]/g, '')) || 0;
+      }
+    }
+    const isFree = tryoutFeeAmt === 0;
+
     const reg = await TryoutRegistration.create({
-      coach_id:     req.params.id,
-      completed_by: completedBy||'', name,
-      address: address||'', city: city||'', state: state||'', zip: zip||'',
-      cell: cell||'', email: email||'',
-      player_name: playerName, age: age||'', dob: dob||'', hw: hw||'',
-      pos1: pos1||'', pos2: pos2||'', tryout_date: tryoutDate||''
+      coach_id:          req.params.id,
+      completed_by:      completedBy||'', name,
+      address:           address||'', city: city||'', state: state||'', zip: zip||'',
+      cell:              cell||'', email: email||'',
+      player_name:       playerName, age: age||'', dob: dob||'', hw: hw||'',
+      pos1:              pos1||'', pos2: pos2||'', tryout_date: tryoutDate||'',
+      tryout_fee:        tryoutFeeStr,
+      tryout_fee_amount: tryoutFeeAmt,
+      payment_status:    isFree ? 'Free' : 'Pending',
     });
 
     const ghlResult = await upsertGHLContact({
@@ -1352,12 +1410,72 @@ app.post('/api/teams/:id/tryout-registrations', async (req, res) => {
       playerName, age, dob, hw, pos1, pos2, tryoutDate
     });
 
-    res.status(201).json({ message: 'Registration submitted', registration: reg, ghl: ghlResult });
+    res.status(201).json({ message: 'Registration submitted', registration: reg, ghl: ghlResult, isFree, tryoutFeeAmt, regId: reg._id });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
+
+
+// POST /api/stripe/create-tryout-checkout
+app.post('/api/stripe/create-tryout-checkout', async (req, res) => {
+  try {
+    if (!process.env.STRIPE_SECRET_KEY)
+      return res.status(500).json({ message: 'Stripe is not configured on this server.' });
+    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+    const { regId, feeAmount, playerName, playerEmail, teamId } = req.body;
+    if (!regId || !feeAmount || !teamId)
+      return res.status(400).json({ message: 'regId, feeAmount, and teamId are required' });
+    const amountCents = Math.round(parseFloat(feeAmount) * 100);
+    if (isNaN(amountCents) || amountCents < 50)
+      return res.status(400).json({ message: 'feeAmount must be at least $0.50' });
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'payment',
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: 'Tryout Fee',
+            description: `Tryout registration fee for ${playerName || 'player'}`,
+          },
+          unit_amount: amountCents,
+        },
+        quantity: 1,
+      }],
+      success_url: `${FRONTEND_BASE}/team.html?id=${teamId}&tryout_payment=success&regId=${regId}`,
+      cancel_url:  `${FRONTEND_BASE}/team.html?id=${teamId}&tryout_payment=cancelled`,
+      metadata: { regId, teamId, type: 'tryout' },
+      ...(playerEmail ? { customer_email: playerEmail } : {}),
+    });
+
+    // Store session ID on the registration record
+    await TryoutRegistration.findByIdAndUpdate(regId, { stripe_session_id: session.id });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error('Stripe tryout checkout error:', err);
+    res.status(500).json({ message: err.message || 'Stripe error' });
+  }
+});
+
+// PUT /api/coach/tryout-registrations/:id/mark-paid  (manual override by coach)
+app.put('/api/coach/tryout-registrations/:id/mark-paid', requireAuth, async (req, res) => {
+  try {
+    const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    const reg = await TryoutRegistration.findOneAndUpdate(
+      { _id: req.params.id, coach_id: req.coachId },
+      { payment_status: 'Paid', payment_date: today },
+      { new: true }
+    );
+    if (!reg) return res.status(404).json({ message: 'Registration not found' });
+    res.json({ message: 'Marked as paid', registration: reg });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // Vercel serverless — no app.listen needed
 module.exports = app;
