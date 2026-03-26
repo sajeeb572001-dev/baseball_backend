@@ -186,6 +186,8 @@ tryoutSchema.index({ coach_id: 1 });
 
 const tryoutRegistrationSchema = new mongoose.Schema({
   coach_id:          { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
+  tryout_time:       { type: String, default: '' },
+  tryout_location:   { type: String, default: '' },
   completed_by:      { type: String, default: '' },
   name:              { type: String, default: '' },
   address:           { type: String, default: '' },
@@ -1378,23 +1380,30 @@ app.get('/api/teams/:id/financials', async (req, res) => {
 app.post('/api/teams/:id/tryout-registrations', async (req, res) => {
   try {
     const { completedBy, name, address, city, state, zip, cell, email,
-            playerName, age, dob, hw, pos1, pos2, tryoutDate } = req.body;
+            playerName, age, dob, hw, pos1, pos2, tryoutDate, tryoutTime, tryoutLocation } = req.body;
     if (!name || !playerName) return res.status(400).json({ message: 'Name and player name are required' });
 
-    // Look up the tryout fee for this coach + date
+    // Look up the tryout fee — match by date + time + location for uniqueness
     let tryoutFeeStr = 'Free';
     let tryoutFeeAmt = 0;
-    if (tryoutDate) {
-      const tryout = await Tryout.findOne({ coach_id: req.params.id, date: tryoutDate });
-      if (tryout && tryout.fee && tryout.fee !== 'Free') {
-        tryoutFeeStr = tryout.fee;
-        tryoutFeeAmt = parseFloat(tryout.fee.replace(/[^0-9.]/g, '')) || 0;
-      }
+    let tryout = null;
+    if (tryoutDate && tryoutTime && tryoutLocation) {
+      tryout = await Tryout.findOne({ coach_id: req.params.id, date: tryoutDate, time: tryoutTime, location: tryoutLocation });
+    }
+    if (!tryout && tryoutDate) {
+      // Fallback: match by date only (for old records or missing time/location)
+      tryout = await Tryout.findOne({ coach_id: req.params.id, date: tryoutDate });
+    }
+    if (tryout && tryout.fee && tryout.fee !== 'Free') {
+      tryoutFeeStr = tryout.fee;
+      tryoutFeeAmt = parseFloat(tryout.fee.replace(/[^0-9.]/g, '')) || 0;
     }
     const isFree = tryoutFeeAmt === 0;
 
     const reg = await TryoutRegistration.create({
       coach_id:          req.params.id,
+      tryout_time:       tryoutTime    || '',
+      tryout_location:   tryoutLocation || '',
       completed_by:      completedBy||'', name,
       address:           address||'', city: city||'', state: state||'', zip: zip||'',
       cell:              cell||'', email: email||'',
