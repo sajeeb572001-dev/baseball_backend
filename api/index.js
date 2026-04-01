@@ -9,13 +9,18 @@ const crypto   = require('crypto');
 const nodemailer = require('nodemailer');
 const Stripe   = require('stripe');
 
+// ── STRIPE INIT ───────────────────────────────────────────────
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
+
 // ── EMAIL TRANSPORTER ─────────────────────────────────────────
 function createTransporter() {
   return nodemailer.createTransport({
     service: 'gmail',
     auth: {
-      user: process.env.EMAIL_USER,  // your Gmail address
-      pass: process.env.EMAIL_PASS,  // Gmail App Password (16-char, no spaces)
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
     },
   });
 }
@@ -23,7 +28,7 @@ function createTransporter() {
 async function sendOTPEmail(toEmail, otp, purpose) {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     console.warn('⚠️  EMAIL_USER / EMAIL_PASS not set — skipping email send. OTP:', otp);
-    return; // In dev, OTP is still returned in the API response for testing
+    return;
   }
   const subject = purpose === 'reset'
     ? 'Ambassadors Baseball – Password Reset Code'
@@ -71,63 +76,60 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// ── STRIPE WEBHOOK (raw body — MUST be registered before express.json()) ────
-// Stripe requires the raw unparsed body to verify the webhook signature.
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig    = req.headers['stripe-signature'];
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+// ── STRIPE WEBHOOK — must receive raw body, register BEFORE express.json() ──
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe) return res.status(500).json({ message: 'Stripe not configured' });
 
-  if (!secret) {
-    console.warn('⚠️  STRIPE_WEBHOOK_SECRET not set — skipping webhook');
-    return res.json({ received: true });
-  }
-
+  const sig = req.headers['stripe-signature'];
   let event;
   try {
-    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-    event = stripe.webhooks.constructEvent(req.body, sig, secret);
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('Stripe webhook signature error:', err.message);
+    console.error('⚠️  Stripe webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   if (event.type === 'checkout.session.completed') {
-    const session  = event.data.object;
-    const meta     = session.metadata || {};
-    const today    = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    const session = event.data.object;
+    const { playerPaymentId, paymentType } = session.metadata || {};
+    const amountPaid = session.amount_total / 100; // cents → dollars
 
-    // ── TRYOUT FEE PAYMENT ──
-    if (meta.type === 'tryout' && meta.regId) {
+    if (playerPaymentId) {
       try {
-        await TryoutRegistration.findByIdAndUpdate(meta.regId, {
-          payment_status: 'Paid',
-          payment_date:   today,
-        });
-        console.log('Tryout fee recorded for regId=' + meta.regId);
-      } catch (err) {
-        console.error('Error updating tryout registration after Stripe webhook:', err);
-      }
-    }
+        const existing = await PlayerPayment.findById(playerPaymentId);
+        if (existing) {
+          const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+          const update = {};
 
-    // ── PLAYER DEPOSIT PAYMENT ──
-    if (meta.paymentId) {
-      const depositAmount = (session.amount_total || 0) / 100;
-      try {
-        const payment = await PlayerPayment.findById(meta.paymentId);
-        if (payment && !payment.deposit_paid) {
-          const newBalance = Math.max(0, payment.total_fee - depositAmount);
-          const newStatus  = newBalance <= 0 ? 'Paid' : 'Partial';
-          await PlayerPayment.findByIdAndUpdate(meta.paymentId, {
-            deposit_paid:      true,
-            deposit_paid_date: today,
-            amount_paid:       depositAmount,
-            balance:           newBalance,
-            status:            newStatus,
-          });
-          console.log('Stripe deposit recorded for paymentId=' + meta.paymentId);
+          if (paymentType === 'deposit') {
+            const newAmountPaid = (existing.amount_paid || 0) + amountPaid;
+            const newBalance    = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
+            update.deposit_paid      = true;
+            update.deposit_paid_date = today;
+            update.amount_paid       = newAmountPaid;
+            update.balance           = newBalance;
+            update.status            = newBalance <= 0 ? 'Paid' : 'Partial';
+          } else if (paymentType === 'full' || paymentType === 'remainder') {
+            update.amount_paid = existing.total_fee;
+            update.balance     = 0;
+            update.status      = 'Paid';
+            if (paymentType === 'deposit') {
+              update.deposit_paid      = true;
+              update.deposit_paid_date = today;
+            }
+          } else if (paymentType === 'installment') {
+            const newAmountPaid = (existing.amount_paid || 0) + amountPaid;
+            const newBalance    = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
+            update.amount_paid = newAmountPaid;
+            update.balance     = newBalance;
+            update.status      = newBalance <= 0 ? 'Paid' : 'Partial';
+          }
+
+          await PlayerPayment.findByIdAndUpdate(playerPaymentId, update);
+          console.log(`✅  Stripe payment recorded — playerPaymentId=${playerPaymentId} type=${paymentType}`);
         }
-      } catch (err) {
-        console.error('Error updating payment record after Stripe webhook:', err);
+      } catch (dbErr) {
+        console.error('❌  Failed to update PlayerPayment after Stripe webhook:', dbErr.message);
       }
     }
   }
@@ -166,11 +168,10 @@ const coachSchema = new mongoose.Schema({
   active:             { type: Boolean, default: true },
   otp_code:           { type: String,  default: null },
   otp_expiry:         { type: Date,    default: null },
-  otp_purpose:        { type: String,  default: null }, // 'reset'
-  reset_token:        { type: String,  default: null }, // kept for backward compat
+  otp_purpose:        { type: String,  default: null },
+  reset_token:        { type: String,  default: null },
   reset_token_expiry: { type: Date,    default: null },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
-// Indexes
 coachSchema.index({ active: 1 });
 
 const tryoutSchema = new mongoose.Schema({
@@ -185,27 +186,22 @@ const tryoutSchema = new mongoose.Schema({
 tryoutSchema.index({ coach_id: 1 });
 
 const tryoutRegistrationSchema = new mongoose.Schema({
-  coach_id:          { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
-  completed_by:      { type: String, default: '' },
-  name:              { type: String, default: '' },
-  address:           { type: String, default: '' },
-  city:              { type: String, default: '' },
-  state:             { type: String, default: '' },
-  zip:               { type: String, default: '' },
-  cell:              { type: String, default: '' },
-  email:             { type: String, default: '' },
-  player_name:       { type: String, default: '' },
-  age:               { type: String, default: '' },
-  dob:               { type: String, default: '' },
-  hw:                { type: String, default: '' },
-  pos1:              { type: String, default: '' },
-  pos2:              { type: String, default: '' },
-  tryout_date:       { type: String, default: '' },
-  tryout_fee:        { type: String, default: 'Free' },
-  tryout_fee_amount: { type: Number, default: 0 },
-  payment_status:    { type: String, default: 'Free' }, // 'Free' | 'Pending' | 'Paid'
-  payment_date:      { type: String, default: '' },
-  stripe_session_id: { type: String, default: '' },
+  coach_id:     { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
+  completed_by: { type: String, default: '' },
+  name:         { type: String, default: '' },
+  address:      { type: String, default: '' },
+  city:         { type: String, default: '' },
+  state:        { type: String, default: '' },
+  zip:          { type: String, default: '' },
+  cell:         { type: String, default: '' },
+  email:        { type: String, default: '' },
+  player_name:  { type: String, default: '' },
+  age:          { type: String, default: '' },
+  dob:          { type: String, default: '' },
+  hw:           { type: String, default: '' },
+  pos1:         { type: String, default: '' },
+  pos2:         { type: String, default: '' },
+  tryout_date:  { type: String, default: '' },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 tryoutRegistrationSchema.index({ coach_id: 1 });
 
@@ -237,13 +233,24 @@ const scheduleSchema = new mongoose.Schema({
 scheduleSchema.index({ coach_id: 1, date_sort: 1 });
 
 const teamFinancialsSchema = new mongoose.Schema({
-  coach_id:         { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true, unique: true },
-  player_fee:       { type: Number, default: 0 },
-  payment_deadline: { type: String, default: '' },
-  full_pay_only:    { type: Boolean, default: true },
-  deposit_enabled:  { type: Boolean, default: false },
-  deposit_amount:   { type: Number, default: 250 },
-  monthly_payments: { type: Boolean, default: false },
+  coach_id:           { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true, unique: true },
+  player_fee:         { type: Number, default: 0 },
+  payment_deadline:   { type: String, default: '' },
+  full_pay_only:      { type: Boolean, default: true },
+  deposit_enabled:    { type: Boolean, default: false },
+  deposit_amount:     { type: Number, default: 250 },
+  monthly_payments:   { type: Boolean, default: false },
+  installment_months: { type: Number, default: 3 },
+
+  ghl_product_full:        { type: String, default: '' },
+  ghl_product_deposit:     { type: String, default: '' },
+  ghl_product_remainder:   { type: String, default: '' },
+  ghl_product_installment: { type: String, default: '' },
+
+  ghl_price_full:        { type: String, default: '' },
+  ghl_price_deposit:     { type: String, default: '' },
+  ghl_price_remainder:   { type: String, default: '' },
+  ghl_price_installment: { type: String, default: '' },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 
 const playerPaymentSchema = new mongoose.Schema({
@@ -304,13 +311,19 @@ const Budget             = mongoose.model('Budget',             budgetSchema);
 //  GHL HELPERS
 // ════════════════════════════════════════════════════════════════
 
+const GHL_HEADERS = () => ({
+  'Authorization': `Bearer ${process.env.GHL_API_KEY}`,
+  'Content-Type':  'application/json',
+  'Accept':        'application/json',
+  'Version':       '2021-07-28',
+});
+
 // ── GHL MEDIA UPLOAD ──────────────────────────────────────────
 async function uploadImageToGHL(base64, fileName, mimeType) {
   const buffer = Buffer.from(base64, 'base64');
   const form   = new FormData();
   form.append('file', buffer, { filename: fileName, contentType: mimeType || 'image/jpeg' });
   form.append('fileAltText', fileName);
-  // Note: do NOT pass hosted=true — that requires a URL, not raw bytes
 
   const response = await axios.post(
     'https://services.leadconnectorhq.com/medias/upload-file',
@@ -330,6 +343,104 @@ async function uploadImageToGHL(base64, fileName, mimeType) {
   return url;
 }
 
+// ── GHL PRODUCT + PRICE CREATION ─────────────────────────────
+/**
+ * Creates a GHL product then a price under it.
+ *
+ * GHL docs confirm:
+ *   - amount is in DOLLARS  (e.g. 250, not 25000)
+ *   - type uses underscore  "one_time" | "recurring"
+ *   - locationId required on BOTH product AND price payloads
+ *
+ * @param {string}      name       - Display name for product and price
+ * @param {number}      amount     - Dollar amount e.g. 250
+ * @param {object|null} recurring  - null = one_time; { interval: 'month', intervalCount: 1 } = recurring
+ * @returns {{ productId: string, priceId: string }}
+ */
+async function createGHLProductWithPrice(name, amount, recurring = null) {
+  // ── Step 1: Create product ────────────────────────────────
+  let productId;
+  try {
+    const productRes = await axios.post(
+      'https://services.leadconnectorhq.com/products/',
+      {
+        locationId:  process.env.GHL_LOCATION_ID,
+        name,
+        productType: 'SERVICE',
+      },
+      { headers: GHL_HEADERS() }
+    );
+
+    productId = productRes.data?._id
+      || productRes.data?.product?._id
+      || productRes.data?.id;
+
+    if (!productId) {
+      throw new Error('No product ID in response: ' + JSON.stringify(productRes.data));
+    }
+    console.log(`📦  GHL product created: "${name}" → ${productId}`);
+  } catch (err) {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    throw new Error(`GHL create product failed for "${name}": ${detail}`);
+  }
+
+  // ── Step 2: Create price ──────────────────────────────────
+  const pricePayload = {
+    locationId: process.env.GHL_LOCATION_ID,
+    name,
+    amount:     Number(amount),
+    currency:   'USD',
+    type:       recurring ? 'recurring' : 'one_time',
+  };
+
+  if (recurring) {
+    pricePayload.recurring = {
+      interval:      recurring.interval,
+      intervalCount: recurring.intervalCount,
+    };
+  }
+
+  let priceId;
+  try {
+    const priceRes = await axios.post(
+      `https://services.leadconnectorhq.com/products/${productId}/price`,
+      pricePayload,
+      { headers: GHL_HEADERS() }
+    );
+
+    priceId = priceRes.data?._id
+      || priceRes.data?.price?._id
+      || priceRes.data?.id;
+
+    if (!priceId) {
+      throw new Error('No price ID in response: ' + JSON.stringify(priceRes.data));
+    }
+    console.log(`💰  GHL price created: "${name}" $${amount} → priceId=${priceId}`);
+  } catch (err) {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error(`❌  GHL price creation failed (orphan productId=${productId}):`, detail);
+    throw new Error(`GHL create price failed for "${name}": ${detail}`);
+  }
+
+  return { productId, priceId };
+}
+
+/**
+ * Deletes a GHL product by ID. Best-effort — never throws.
+ */
+async function deleteGHLProduct(productId) {
+  if (!productId) return;
+  try {
+    await axios.delete(
+      `https://services.leadconnectorhq.com/products/${productId}`,
+      { headers: GHL_HEADERS() }
+    );
+    console.log(`🗑️  GHL product deleted: ${productId}`);
+  } catch (err) {
+    console.warn(`⚠️  Could not delete GHL product ${productId}:`, err.response?.data || err.message);
+  }
+}
+
 // ── GHL CONTACT UPSERT (tryout registration) ──────────────────
 async function upsertGHLContact({ completedBy, name, address, city, state, zip, cell, email,
                                    playerName, age, dob, hw, pos1, pos2, tryoutDate }) {
@@ -343,28 +454,32 @@ async function upsertGHLContact({ completedBy, name, address, city, state, zip, 
   if (tryoutDate) { const d = new Date(tryoutDate); if (!isNaN(d)) formattedTryoutDate = d.toISOString(); }
 
   try {
-    const response = await axios.post('https://services.leadconnectorhq.com/contacts/upsert', {
-      locationId:  process.env.GHL_LOCATION_ID,
-      firstName:   nameParts[0] || '',
-      lastName:    nameParts.slice(1).join(' ') || '',
-      email:       email   || '',
-      phone:       cell    || '',
-      address1:    address || '',
-      city:        city    || '',
-      state:       state   || '',
-      postalCode:  zip     || '',
-      dateOfBirth: formattedDob,
-      tags: ['Baseball Tryout'],
-      customFields: [
-        { key: 'player_name',    value: playerName          || '' },
-        { key: 'position_1',     value: pos1                || '' },
-        { key: 'position_2',     value: pos2                || '' },
-        { key: 'age',            value: age                 || '' },
-        { key: 'completed_by',   value: completedBy         || '' },
-        { key: 'tryout_date',    value: formattedTryoutDate      },
-        { key: 'height__weight', value: hw                  || '' },
-      ],
-    }, { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Content-Type': 'application/json', 'Version': '2021-07-28' } });
+    const response = await axios.post(
+      'https://services.leadconnectorhq.com/contacts/upsert',
+      {
+        locationId:  process.env.GHL_LOCATION_ID,
+        firstName:   nameParts[0] || '',
+        lastName:    nameParts.slice(1).join(' ') || '',
+        email:       email   || '',
+        phone:       cell    || '',
+        address1:    address || '',
+        city:        city    || '',
+        state:       state   || '',
+        postalCode:  zip     || '',
+        dateOfBirth: formattedDob,
+        tags: ['Baseball Tryout'],
+        customFields: [
+          { key: 'player_name',    value: playerName          || '' },
+          { key: 'position_1',     value: pos1                || '' },
+          { key: 'position_2',     value: pos2                || '' },
+          { key: 'age',            value: age                 || '' },
+          { key: 'completed_by',   value: completedBy         || '' },
+          { key: 'tryout_date',    value: formattedTryoutDate      },
+          { key: 'height__weight', value: hw                  || '' },
+        ],
+      },
+      { headers: GHL_HEADERS() }
+    );
     return { success: true, contactId: response.data?.contact?.id || '' };
   } catch (err) {
     const errMsg = err.response?.data ? JSON.stringify(err.response.data) : err.message;
@@ -378,23 +493,27 @@ async function upsertGHLPlayer({ name, email, cell, city, state, position, jerse
   if (!process.env.GHL_API_KEY || !process.env.GHL_LOCATION_ID) return;
   const nameParts = (name || '').trim().split(' ');
   try {
-    await axios.post('https://services.leadconnectorhq.com/contacts/upsert', {
-      locationId: process.env.GHL_LOCATION_ID,
-      firstName:  nameParts[0] || '',
-      lastName:   nameParts.slice(1).join(' ') || '',
-      email:  email || '',
-      phone:  cell  || '',
-      city:   city  || '',
-      state:  state || '',
-      tags:   ['Player'],
-      customFields: [
-        { key: 'players_name',  value: name     || '' },
-        { key: 'position',      value: position || '' },
-        { key: 'grad_year',     value: gradYear || '' },
-        { key: 'jersey_number', value: jersey   || '' },
-        { key: 'ht__wt',        value: hw       || '' },
-      ],
-    }, { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Content-Type': 'application/json', 'Version': '2021-07-28' } });
+    await axios.post(
+      'https://services.leadconnectorhq.com/contacts/upsert',
+      {
+        locationId: process.env.GHL_LOCATION_ID,
+        firstName:  nameParts[0] || '',
+        lastName:   nameParts.slice(1).join(' ') || '',
+        email:  email || '',
+        phone:  cell  || '',
+        city:   city  || '',
+        state:  state || '',
+        tags:   ['Player'],
+        customFields: [
+          { key: 'players_name',  value: name     || '' },
+          { key: 'position',      value: position || '' },
+          { key: 'grad_year',     value: gradYear || '' },
+          { key: 'jersey_number', value: jersey   || '' },
+          { key: 'ht__wt',        value: hw       || '' },
+        ],
+      },
+      { headers: GHL_HEADERS() }
+    );
   } catch (err) {
     console.error('GHL player upsert error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
   }
@@ -404,21 +523,25 @@ async function upsertGHLPlayer({ name, email, cell, city, state, position, jerse
 async function upsertGHLCoach({ firstName, lastName, email, phone, teamName, state, city, ageGroup, bio }) {
   if (!process.env.GHL_API_KEY || !process.env.GHL_LOCATION_ID) return;
   try {
-    await axios.post('https://services.leadconnectorhq.com/contacts/upsert', {
-      locationId: process.env.GHL_LOCATION_ID,
-      firstName:  firstName || '',
-      lastName:   lastName  || '',
-      email:      email     || '',
-      phone:      phone     || '',
-      city:       city      || '',
-      state:      state     || '',
-      tags:       ['Head Coach Name'],
-      customFields: [
-        { key: 'team_name',  value: teamName  || '' },
-        { key: 'age_group',  value: ageGroup  || '' },
-        { key: 'bio',        value: bio       || '' },
-      ],
-    }, { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Content-Type': 'application/json', 'Version': '2021-07-28' } });
+    await axios.post(
+      'https://services.leadconnectorhq.com/contacts/upsert',
+      {
+        locationId: process.env.GHL_LOCATION_ID,
+        firstName:  firstName || '',
+        lastName:   lastName  || '',
+        email:      email     || '',
+        phone:      phone     || '',
+        city:       city      || '',
+        state:      state     || '',
+        tags:       ['Head Coach Name'],
+        customFields: [
+          { key: 'team_name',  value: teamName  || '' },
+          { key: 'age_group',  value: ageGroup  || '' },
+          { key: 'bio',        value: bio       || '' },
+        ],
+      },
+      { headers: GHL_HEADERS() }
+    );
   } catch (err) {
     console.error('GHL coach upsert error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
   }
@@ -517,68 +640,13 @@ function normalizeGame(g) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  STRIPE ROUTES
-// ════════════════════════════════════════════════════════════════
-
-const FRONTEND_BASE = 'https://baseball-frontend-mu.vercel.app';
-
-// POST /api/stripe/create-checkout-session
-// Called by team.html when a player clicks "Pay Deposit"
-app.post('/api/stripe/create-checkout-session', async (req, res) => {
-  try {
-    if (!process.env.STRIPE_SECRET_KEY) {
-      return res.status(500).json({ message: 'Stripe is not configured on this server.' });
-    }
-    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
-    const { paymentId, depositAmount, playerName, playerEmail, teamId } = req.body;
-    if (!paymentId || !depositAmount || !teamId) {
-      return res.status(400).json({ message: 'paymentId, depositAmount, and teamId are required' });
-    }
-
-    const amountCents = Math.round(parseFloat(depositAmount) * 100);
-    if (isNaN(amountCents) || amountCents < 50) {
-      return res.status(400).json({ message: 'depositAmount must be at least $0.50' });
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      mode: 'payment',
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: 'Team Deposit',
-            description: `Deposit for ${playerName || 'player'} — secures your spot on the team`,
-          },
-          unit_amount: amountCents,
-        },
-        quantity: 1,
-      }],
-      // Success redirects back to the same team page with markers in the URL
-      success_url: `${FRONTEND_BASE}/team.html?id=${teamId}&payment=success&paymentId=${paymentId}`,
-      cancel_url:  `${FRONTEND_BASE}/team.html?id=${teamId}&payment=cancelled`,
-      // Pass IDs through so the webhook can update the DB
-      metadata: { paymentId, teamId },
-      // Pre-fill the email field in Stripe Checkout if we have it
-      ...(playerEmail ? { customer_email: playerEmail } : {}),
-    });
-
-    res.json({ url: session.url, sessionId: session.id });
-  } catch (err) {
-    console.error('Stripe create-checkout-session error:', err);
-    res.status(500).json({ message: err.message || 'Stripe error' });
-  }
-});
-
-// ════════════════════════════════════════════════════════════════
 //  TEMP: GET GHL CUSTOM FIELDS
 // ════════════════════════════════════════════════════════════════
 app.get('/api/ghl-fields', async (req, res) => {
   try {
     const response = await axios.get(
       `https://services.leadconnectorhq.com/contacts/custom-fields?locationId=${process.env.GHL_LOCATION_ID}`,
-      { headers: { 'Authorization': `Bearer ${process.env.GHL_API_KEY}`, 'Content-Type': 'application/json', 'Version': '2021-07-28' } }
+      { headers: GHL_HEADERS() }
     );
     res.json(response.data);
   } catch (err) {
@@ -646,18 +714,17 @@ app.post('/api/coach/login', async (req, res) => {
   }
 });
 
-// POST /api/coach/forgot-password  — step 1: send OTP to email
+// POST /api/coach/forgot-password
 app.post('/api/coach/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
     const coach = await Coach.findOne({ email: email.toLowerCase().trim() });
-    // Always respond the same way to avoid user enumeration
     if (!coach) return res.json({ message: 'If that email exists, a 6-digit code has been sent.' });
 
     const otp    = generateOTP();
-    const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+    const expiry = new Date(Date.now() + 10 * 60 * 1000);
 
     await Coach.findByIdAndUpdate(coach._id, {
       otp_code:    otp,
@@ -669,7 +736,7 @@ app.post('/api/coach/forgot-password', async (req, res) => {
 
     res.json({
       message: 'If that email exists, a 6-digit code has been sent.',
-      ...((!process.env.EMAIL_USER) && { devOtp: otp }), // only in dev when email not configured
+      ...((!process.env.EMAIL_USER) && { devOtp: otp }),
     });
   } catch (err) {
     console.error(err);
@@ -677,7 +744,7 @@ app.post('/api/coach/forgot-password', async (req, res) => {
   }
 });
 
-// POST /api/coach/verify-otp-reset  — step 2: verify OTP + set new password
+// POST /api/coach/verify-otp-reset
 app.post('/api/coach/verify-otp-reset', async (req, res) => {
   try {
     const { email, otp, password } = req.body;
@@ -778,7 +845,6 @@ app.put('/api/coach/update-assistants', requireAuth, async (req, res) => {
   }
 });
 
-// ── IMAGE UPLOAD (GHL Media) ──────────────────────────────────
 // POST /api/coach/upload-image
 app.post('/api/coach/upload-image', requireAuth, async (req, res) => {
   try {
@@ -787,7 +853,6 @@ app.post('/api/coach/upload-image', requireAuth, async (req, res) => {
 
     const imageUrl = await uploadImageToGHL(base64, fileName, mimeType);
 
-    // Save to correct field
     if (saveToProfile || slot === 'head') {
       await Coach.findByIdAndUpdate(req.coachId, { image_url: imageUrl });
     }
@@ -809,7 +874,6 @@ app.post('/api/coach/upload-image', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/coach/delete-image
-// Note: GHL has no public delete API — we only clear the URL from DB
 app.delete('/api/coach/delete-image', requireAuth, async (req, res) => {
   try {
     const { slot } = req.body;
@@ -833,7 +897,6 @@ app.delete('/api/coach/delete-image', requireAuth, async (req, res) => {
 
 // ── TRYOUT ROUTES ─────────────────────────────────────────────
 
-// GET /api/coach/tryouts
 app.get('/api/coach/tryouts', requireAuth, async (req, res) => {
   try {
     const tryouts = await Tryout.find({ coach_id: req.coachId }).sort({ created_at: 1 });
@@ -843,20 +906,21 @@ app.get('/api/coach/tryouts', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/coach/tryouts
 app.post('/api/coach/tryouts', requireAuth, async (req, res) => {
   try {
     const { date, time, location, fee, city, state } = req.body;
     if (!date || !time || !location || !fee)
       return res.status(400).json({ message: 'date, time, location and fee are all required' });
-    const tryout = await Tryout.create({ coach_id: req.coachId, date, time, location, fee, city: city||'', state: state||'' });
+    const tryout = await Tryout.create({
+      coach_id: req.coachId, date, time, location, fee,
+      city: city || '', state: state || '',
+    });
     res.status(201).json({ message: 'Tryout added', tryout: normalizeTryout(tryout) });
   } catch (err) {
     res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 
-// PUT /api/coach/tryouts/:tryoutId
 app.put('/api/coach/tryouts/:tryoutId', requireAuth, async (req, res) => {
   try {
     const { date, time, location, fee, city, state } = req.body;
@@ -864,7 +928,7 @@ app.put('/api/coach/tryouts/:tryoutId', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'date, time and location are required' });
     const tryout = await Tryout.findOneAndUpdate(
       { _id: req.params.tryoutId, coach_id: req.coachId },
-      { date, time, location, fee: fee||'Free', city: city||'', state: state||'' },
+      { date, time, location, fee: fee || 'Free', city: city || '', state: state || '' },
       { new: true }
     );
     if (!tryout) return res.status(404).json({ message: 'Tryout not found' });
@@ -874,7 +938,6 @@ app.put('/api/coach/tryouts/:tryoutId', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/coach/tryouts/:tryoutId
 app.delete('/api/coach/tryouts/:tryoutId', requireAuth, async (req, res) => {
   try {
     await Tryout.findOneAndDelete({ _id: req.params.tryoutId, coach_id: req.coachId });
@@ -884,7 +947,6 @@ app.delete('/api/coach/tryouts/:tryoutId', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/coach/tryout-registrations
 app.get('/api/coach/tryout-registrations', requireAuth, async (req, res) => {
   try {
     const data = await TryoutRegistration.find({ coach_id: req.coachId }).sort({ created_at: -1 });
@@ -896,7 +958,6 @@ app.get('/api/coach/tryout-registrations', requireAuth, async (req, res) => {
 
 // ── SCHEDULE ROUTES ───────────────────────────────────────────
 
-// GET /api/coach/schedule
 app.get('/api/coach/schedule', requireAuth, async (req, res) => {
   try {
     const data = await Schedule.find({ coach_id: req.coachId }).sort({ date_sort: 1 });
@@ -906,7 +967,6 @@ app.get('/api/coach/schedule', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/coach/schedule
 app.post('/api/coach/schedule', requireAuth, async (req, res) => {
   try {
     const { startDate, endDate, event, city, state } = req.body;
@@ -918,8 +978,8 @@ app.post('/api/coach/schedule', requireAuth, async (req, res) => {
       start_date: startDate,
       end_date:   endDate,
       event,
-      city:       city||'',
-      state:      state||'',
+      city:       city  || '',
+      state:      state || '',
       date_sort:  startDate,
     });
     res.status(201).json({ message: 'Game added', game: normalizeGame(game) });
@@ -928,7 +988,6 @@ app.post('/api/coach/schedule', requireAuth, async (req, res) => {
   }
 });
 
-// PUT /api/coach/schedule/:gameId
 app.put('/api/coach/schedule/:gameId', requireAuth, async (req, res) => {
   try {
     const { startDate, endDate, event, city, state } = req.body;
@@ -936,7 +995,7 @@ app.put('/api/coach/schedule/:gameId', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'Start date, end date, and event are required' });
     const game = await Schedule.findOneAndUpdate(
       { _id: req.params.gameId, coach_id: req.coachId },
-      { date: startDate, start_date: startDate, end_date: endDate, event, city: city||'', state: state||'', date_sort: startDate },
+      { date: startDate, start_date: startDate, end_date: endDate, event, city: city || '', state: state || '', date_sort: startDate },
       { new: true }
     );
     if (!game) return res.status(404).json({ message: 'Game not found' });
@@ -946,7 +1005,6 @@ app.put('/api/coach/schedule/:gameId', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/coach/schedule/:gameId
 app.delete('/api/coach/schedule/:gameId', requireAuth, async (req, res) => {
   try {
     await Schedule.findOneAndDelete({ _id: req.params.gameId, coach_id: req.coachId });
@@ -958,7 +1016,6 @@ app.delete('/api/coach/schedule/:gameId', requireAuth, async (req, res) => {
 
 // ── FINANCIALS ROUTES ─────────────────────────────────────────
 
-// GET /api/coach/financials
 app.get('/api/coach/financials', requireAuth, async (req, res) => {
   try {
     const data = await TeamFinancials.findOne({ coach_id: req.coachId });
@@ -969,67 +1026,267 @@ app.get('/api/coach/financials', requireAuth, async (req, res) => {
 });
 
 // POST /api/coach/financials
+// Creates or updates financial settings and syncs GHL products/prices.
+//
+// Rules:
+//   • Deposit OFF  → only Full Payment product in GHL
+//   • Deposit ON   → only Deposit + Remaining Balance products in GHL (no Full Payment)
+//   • Monthly payments can exist alongside either of the above
+//   • Fee change   → delete all old GHL products and recreate fresh
+//   • Toggle OFF   → delete that product, clear stored IDs
+//   • GHL failure  → logs error but always saves to MongoDB
 app.post('/api/coach/financials', requireAuth, async (req, res) => {
   try {
-    const { playerFee, paymentDeadline, fullPayOnly, depositEnabled, depositAmount, monthlyPayments } = req.body;
+    const {
+      playerFee,
+      paymentDeadline,
+      fullPayOnly,
+      depositEnabled,
+      depositAmount,
+      monthlyPayments,
+      installmentMonths,
+    } = req.body;
+
+    // ── Fetch coach team name for GHL product labels ──────────
+    const coach = await Coach.findById(req.coachId).select('team_name');
+    const teamLabel = coach?.team_name || 'Team';
+
+    // ── Fetch existing record ─────────────────────────────────
+    const existing = await TeamFinancials.findOne({ coach_id: req.coachId });
+
+    // ── Dollar amounts ────────────────────────────────────────
+    const fee         = Number(playerFee)         || 0;
+    const deposit     = Number(depositAmount)     || 250;
+    const months      = Number(installmentMonths) || 3;
+    const remainder   = Math.max(0, fee - deposit);
+    const installment = months > 0
+      ? Math.round((fee / months) * 100) / 100
+      : fee;
+
+    // ── Did the player fee change since last save? ────────────
+    const feeChanged = !!existing && existing.player_fee !== fee;
+
+    // ── Build the MongoDB update object ──────────────────────
+    const update = {
+      coach_id:           req.coachId,
+      player_fee:         fee,
+      payment_deadline:   paymentDeadline || '',
+      full_pay_only:      fullPayOnly !== false,
+      deposit_enabled:    !!depositEnabled,
+      deposit_amount:     deposit,
+      monthly_payments:   !!monthlyPayments,
+      installment_months: months,
+    };
+
+    // ── GHL product/price sync ────────────────────────────────
+    try {
+      // carry() returns the stored ID if fee is unchanged, '' if fee changed (forces recreation)
+      const carry = (field) => feeChanged ? '' : (existing?.[field] || '');
+
+      update.ghl_product_full        = carry('ghl_product_full');
+      update.ghl_price_full          = carry('ghl_price_full');
+      update.ghl_product_deposit     = carry('ghl_product_deposit');
+      update.ghl_price_deposit       = carry('ghl_price_deposit');
+      update.ghl_product_remainder   = carry('ghl_product_remainder');
+      update.ghl_price_remainder     = carry('ghl_price_remainder');
+      update.ghl_product_installment = carry('ghl_product_installment');
+      update.ghl_price_installment   = carry('ghl_price_installment');
+
+      // If fee changed, delete all old GHL products first
+      if (feeChanged && existing) {
+        console.log('💱  Fee changed — deleting old GHL products and recreating...');
+        await Promise.all([
+          deleteGHLProduct(existing.ghl_product_full),
+          deleteGHLProduct(existing.ghl_product_deposit),
+          deleteGHLProduct(existing.ghl_product_remainder),
+          deleteGHLProduct(existing.ghl_product_installment),
+        ]);
+      }
+
+      // ── Full pay product (ONLY when deposit is OFF) ───────
+      if (!depositEnabled) {
+        if (fee > 0 && !update.ghl_product_full) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Full Payment ($${fee})`,
+            fee
+          );
+          update.ghl_product_full = productId;
+          update.ghl_price_full   = priceId;
+        }
+      } else {
+        // Deposit is ON — full pay product is not needed; delete if it exists
+        if (existing?.ghl_product_full && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_full);
+        }
+        update.ghl_product_full = '';
+        update.ghl_price_full   = '';
+      }
+
+      // ── Deposit product (ONLY when deposit is ON) ─────────
+      if (depositEnabled && deposit > 0) {
+        if (!update.ghl_product_deposit) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Deposit ($${deposit})`,
+            deposit
+          );
+          update.ghl_product_deposit = productId;
+          update.ghl_price_deposit   = priceId;
+        }
+      } else {
+        // Deposit toggled OFF — delete if it existed and this isn't a fee-change wipe
+        if (existing?.ghl_product_deposit && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_deposit);
+        }
+        update.ghl_product_deposit = '';
+        update.ghl_price_deposit   = '';
+      }
+
+      // ── Remainder product (balance after deposit, ONLY when deposit is ON) ──
+      if (depositEnabled && remainder > 0) {
+        if (!update.ghl_product_remainder) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Remaining Balance ($${remainder})`,
+            remainder
+          );
+          update.ghl_product_remainder = productId;
+          update.ghl_price_remainder   = priceId;
+        }
+      } else {
+        if (existing?.ghl_product_remainder && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_remainder);
+        }
+        update.ghl_product_remainder = '';
+        update.ghl_price_remainder   = '';
+      }
+
+      // ── Monthly installment product ───────────────────────
+      if (monthlyPayments && installment > 0) {
+        if (!update.ghl_product_installment) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Monthly Installment ($${installment}/mo × ${months})`,
+            installment,
+            { interval: 'month', intervalCount: 1 }
+          );
+          update.ghl_product_installment = productId;
+          update.ghl_price_installment   = priceId;
+        }
+      } else {
+        if (existing?.ghl_product_installment && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_installment);
+        }
+        update.ghl_product_installment = '';
+        update.ghl_price_installment   = '';
+      }
+
+    } catch (ghlErr) {
+      // GHL errors are non-fatal — always fall through to the DB save
+      console.error('⚠️  GHL product sync error:', ghlErr.response?.data || ghlErr.message);
+    }
+
+    // ── Persist to MongoDB ────────────────────────────────────
     const data = await TeamFinancials.findOneAndUpdate(
       { coach_id: req.coachId },
-      {
-        coach_id:         req.coachId,
-        player_fee:       playerFee       || 0,
-        payment_deadline: paymentDeadline || '',
-        full_pay_only:    fullPayOnly     !== false,
-        deposit_enabled:  depositEnabled  || false,
-        deposit_amount:   depositAmount   || 250,
-        monthly_payments: monthlyPayments || false,
-      },
+      update,
       { upsert: true, new: true }
     );
+
     res.json({ message: 'Saved', financials: data });
   } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── STRIPE CHECKOUT ───────────────────────────────────────────
+// POST /api/checkout
+// Body: { coachId, paymentType, playerPaymentId, successUrl, cancelUrl }
+// paymentType: 'full' | 'deposit' | 'remainder' | 'installment'
+app.post('/api/checkout', async (req, res) => {
+  if (!stripe) return res.status(500).json({ message: 'Stripe is not configured on the server' });
+
+  try {
+    const { coachId, paymentType, playerPaymentId, successUrl, cancelUrl } = req.body;
+    if (!coachId || !paymentType || !playerPaymentId) {
+      return res.status(400).json({ message: 'coachId, paymentType, and playerPaymentId are required' });
+    }
+
+    // ── Get team financials to build the product name ─────────
+    const financials = await TeamFinancials.findOne({ coach_id: coachId });
+    if (!financials) return res.status(404).json({ message: 'Team financials not found' });
+
+    const coach = await Coach.findById(coachId).select('team_name');
+    const teamLabel = coach?.team_name || 'Team';
+
+    const fee         = financials.player_fee     || 0;
+    const deposit     = financials.deposit_amount || 250;
+    const months      = financials.installment_months || 3;
+    const remainder   = Math.max(0, fee - deposit);
+    const installment = months > 0 ? Math.round((fee / months) * 100) / 100 : fee;
+
+    // ── Map paymentType → exact Stripe product name ───────────
+    const productNameMap = {
+      full:        `${teamLabel} – Full Payment ($${fee})`,
+      deposit:     `${teamLabel} – Deposit ($${deposit})`,
+      remainder:   `${teamLabel} – Remaining Balance ($${remainder})`,
+      installment: `${teamLabel} – Monthly Installment ($${installment}/mo × ${months})`,
+    };
+
+    const productName = productNameMap[paymentType];
+    if (!productName) return res.status(400).json({ message: `Unknown paymentType: ${paymentType}` });
+
+    // ── Search Stripe for the product by exact name ───────────
+    const productSearch = await stripe.products.search({
+      query: `name:"${productName}"`,
+      limit: 1,
+    });
+
+    if (!productSearch.data.length) {
+      return res.status(404).json({ message: `Stripe product not found: "${productName}". It may still be syncing — please try again in a moment.` });
+    }
+
+    const stripeProduct = productSearch.data[0];
+
+    // ── Get the active price for this product ─────────────────
+    const prices = await stripe.prices.list({ product: stripeProduct.id, active: true, limit: 1 });
+    if (!prices.data.length) {
+      return res.status(404).json({ message: `No active price found for Stripe product: "${productName}"` });
+    }
+
+    const priceId = prices.data[0].id;
+
+    // ── Create checkout session ───────────────────────────────
+    const session = await stripe.checkout.sessions.create({
+      mode: paymentType === 'installment' ? 'subscription' : 'payment',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl || `${req.headers.origin || 'https://baseball-frontend-mu.vercel.app'}?payment=success`,
+      cancel_url:  cancelUrl  || `${req.headers.origin || 'https://baseball-frontend-mu.vercel.app'}?payment=cancelled`,
+      metadata: {
+        playerPaymentId,
+        paymentType,
+        coachId,
+      },
+    });
+
+    console.log(`🛒  Stripe checkout created — type=${paymentType} product="${productName}" session=${session.id}`);
+    res.json({ url: session.url });
+
+  } catch (err) {
+    console.error('❌  Stripe checkout error:', err.message);
     res.status(500).json({ message: err.message });
   }
 });
 
 // ── PLAYER PAYMENTS ROUTES ────────────────────────────────────
 
-// GET /api/coach/player-payments
 app.get('/api/coach/player-payments', requireAuth, async (req, res) => {
   try {
     const data = await PlayerPayment.find({ coach_id: req.coachId }).sort({ created_at: -1 });
-
-    // Enrich each payment record with full player info from the Player collection
-    const enriched = await Promise.all(data.map(async p => {
-      const obj = p.toObject();
-      if (p.player_id) {
-        try {
-          const player = await Player.findById(p.player_id)
-            .select('name email cell city state position jersey grad_year hw');
-          if (player) {
-            obj.player_info = {
-              name:     player.name      || '',
-              email:    player.email     || '',
-              cell:     player.cell      || '',
-              city:     player.city      || '',
-              state:    player.state     || '',
-              position: player.position  || '',
-              jersey:   player.jersey    || '',
-              gradYear: player.grad_year || '',
-              hw:       player.hw        || '',
-            };
-          }
-        } catch(_) {}
-      }
-      return obj;
-    }));
-
-    res.json({ payments: enriched });
+    res.json({ payments: data || [] });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// POST /api/coach/player-payments (public — called from team page)
 app.post('/api/coach/player-payments', async (req, res) => {
   try {
     const { coachId, playerId, playerName, totalFee, depositAmount,
@@ -1055,7 +1312,6 @@ app.post('/api/coach/player-payments', async (req, res) => {
   }
 });
 
-// PUT /api/coach/player-payments/:paymentId
 app.put('/api/coach/player-payments/:paymentId', async (req, res) => {
   try {
     const { depositPaid, depositPaidDate, paymentPlan, amountPaid, balance, status } = req.body;
@@ -1074,7 +1330,6 @@ app.put('/api/coach/player-payments/:paymentId', async (req, res) => {
   }
 });
 
-// DELETE /api/coach/player-payments/:paymentId
 app.delete('/api/coach/player-payments/:paymentId', requireAuth, async (req, res) => {
   try {
     await PlayerPayment.findOneAndDelete({ _id: req.params.paymentId, coach_id: req.coachId });
@@ -1086,7 +1341,6 @@ app.delete('/api/coach/player-payments/:paymentId', requireAuth, async (req, res
 
 // ── BUDGET ROUTES ─────────────────────────────────────────────
 
-// GET /api/coach/budgets
 app.get('/api/coach/budgets', requireAuth, async (req, res) => {
   try {
     const data = await Budget.find({ coach_id: req.coachId }).sort({ created_at: -1 });
@@ -1096,7 +1350,6 @@ app.get('/api/coach/budgets', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/coach/budgets
 app.post('/api/coach/budgets', requireAuth, async (req, res) => {
   try {
     const {
@@ -1106,13 +1359,29 @@ app.post('/api/coach/budgets', requireAuth, async (req, res) => {
       ambassadors, others, total, perPlayer
     } = req.body;
     const data = await Budget.create({
-      coach_id: req.coachId, date,
-      players: players||0, seasons: seasons||0, num_events: numEvents||0, event_cost: eventCost||0,
-      tournaments: tournaments||0, head_pay: headPay||0, asst_pay: asstPay||0,
-      rentals: rentals||0, gas: gas||0, hotel_nights: hotelNights||0, hotel_avg: hotelAvg||0,
-      hotels: hotels||0, num_uniforms: numUniforms||0, uniform_cost: uniformCost||0,
-      uniforms: uniforms||0, equipment: equipment||0, insurance: insurance||0,
-      ambassadors: ambassadors||0, others: others||[], total: total||0, per_player: perPlayer||0,
+      coach_id:     req.coachId,
+      date,
+      players:      players      || 0,
+      seasons:      seasons      || 0,
+      num_events:   numEvents    || 0,
+      event_cost:   eventCost    || 0,
+      tournaments:  tournaments  || 0,
+      head_pay:     headPay      || 0,
+      asst_pay:     asstPay      || 0,
+      rentals:      rentals      || 0,
+      gas:          gas          || 0,
+      hotel_nights: hotelNights  || 0,
+      hotel_avg:    hotelAvg     || 0,
+      hotels:       hotels       || 0,
+      num_uniforms: numUniforms  || 0,
+      uniform_cost: uniformCost  || 0,
+      uniforms:     uniforms     || 0,
+      equipment:    equipment    || 0,
+      insurance:    insurance    || 0,
+      ambassadors:  ambassadors  || 0,
+      others:       others       || [],
+      total:        total        || 0,
+      per_player:   perPlayer    || 0,
     });
     res.status(201).json({ message: 'Budget saved', budget: data });
   } catch (err) {
@@ -1120,7 +1389,6 @@ app.post('/api/coach/budgets', requireAuth, async (req, res) => {
   }
 });
 
-// PUT /api/coach/budgets/:budgetId
 app.put('/api/coach/budgets/:budgetId', requireAuth, async (req, res) => {
   try {
     const {
@@ -1132,12 +1400,27 @@ app.put('/api/coach/budgets/:budgetId', requireAuth, async (req, res) => {
     const data = await Budget.findOneAndUpdate(
       { _id: req.params.budgetId, coach_id: req.coachId },
       {
-        players: players||0, seasons: seasons||0, num_events: numEvents||0, event_cost: eventCost||0,
-        tournaments: tournaments||0, head_pay: headPay||0, asst_pay: asstPay||0,
-        rentals: rentals||0, gas: gas||0, hotel_nights: hotelNights||0, hotel_avg: hotelAvg||0,
-        hotels: hotels||0, num_uniforms: numUniforms||0, uniform_cost: uniformCost||0,
-        uniforms: uniforms||0, equipment: equipment||0, insurance: insurance||0,
-        ambassadors: ambassadors||450, others: others||[], total: total||0, per_player: perPlayer||0,
+        players:      players      || 0,
+        seasons:      seasons      || 0,
+        num_events:   numEvents    || 0,
+        event_cost:   eventCost    || 0,
+        tournaments:  tournaments  || 0,
+        head_pay:     headPay      || 0,
+        asst_pay:     asstPay      || 0,
+        rentals:      rentals      || 0,
+        gas:          gas          || 0,
+        hotel_nights: hotelNights  || 0,
+        hotel_avg:    hotelAvg     || 0,
+        hotels:       hotels       || 0,
+        num_uniforms: numUniforms  || 0,
+        uniform_cost: uniformCost  || 0,
+        uniforms:     uniforms     || 0,
+        equipment:    equipment    || 0,
+        insurance:    insurance    || 0,
+        ambassadors:  ambassadors  || 450,
+        others:       others       || [],
+        total:        total        || 0,
+        per_player:   perPlayer    || 0,
       },
       { new: true }
     );
@@ -1148,7 +1431,6 @@ app.put('/api/coach/budgets/:budgetId', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/coach/budgets/:budgetId
 app.delete('/api/coach/budgets/:budgetId', requireAuth, async (req, res) => {
   try {
     await Budget.findOneAndDelete({ _id: req.params.budgetId, coach_id: req.coachId });
@@ -1162,7 +1444,6 @@ app.delete('/api/coach/budgets/:budgetId', requireAuth, async (req, res) => {
 //  ADMIN ROUTES
 // ════════════════════════════════════════════════════════════════
 
-// POST /api/admin/login
 app.post('/api/admin/login', (req, res) => {
   const { username, password } = req.body;
   if (username !== (process.env.ADMIN_USERNAME || 'admin') ||
@@ -1172,7 +1453,6 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token });
 });
 
-// GET /api/admin/coaches
 app.get('/api/admin/coaches', requireAdmin, async (req, res) => {
   try {
     const coaches = await Coach.find().select('-password').sort({ created_at: -1 });
@@ -1181,7 +1461,6 @@ app.get('/api/admin/coaches', requireAdmin, async (req, res) => {
     ]);
     const countMap = {};
     regCounts.forEach(r => { countMap[r._id.toString()] = r.count; });
-
     res.json({ coaches: coaches.map(c => ({
       id:                c._id,
       firstName:         c.first_name,
@@ -1202,7 +1481,6 @@ app.get('/api/admin/coaches', requireAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/coaches/:id
 app.get('/api/admin/coaches/:id', requireAdmin, async (req, res) => {
   try {
     const c = await Coach.findById(req.params.id).select('-password');
@@ -1230,7 +1508,6 @@ app.get('/api/admin/coaches/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// PUT /api/admin/coaches/:id/toggle-active
 app.put('/api/admin/coaches/:id/toggle-active', requireAdmin, async (req, res) => {
   try {
     const { active } = req.body;
@@ -1241,7 +1518,6 @@ app.put('/api/admin/coaches/:id/toggle-active', requireAdmin, async (req, res) =
   }
 });
 
-// PUT /api/admin/coaches/:id/edit
 app.put('/api/admin/coaches/:id/edit', requireAdmin, async (req, res) => {
   try {
     const { firstName, lastName, email, phone, teamName, state, location, ageGroup } = req.body;
@@ -1259,10 +1535,8 @@ app.put('/api/admin/coaches/:id/edit', requireAdmin, async (req, res) => {
 //  PUBLIC ROUTES
 // ════════════════════════════════════════════════════════════════
 
-// GET /api/teams
 app.get('/api/teams', async (req, res) => {
   try {
-    // active: true OR active field doesn't exist (migrated coaches without the field)
     const teams = await Coach.find({ active: { $ne: false } })
       .select('first_name last_name team_name state location age_group image_url');
     res.json({ teams: teams.map(t => ({
@@ -1278,7 +1552,6 @@ app.get('/api/teams', async (req, res) => {
   }
 });
 
-// GET /api/teams/:id
 app.get('/api/teams/:id', async (req, res) => {
   try {
     const team = await Coach.findById(req.params.id)
@@ -1290,7 +1563,6 @@ app.get('/api/teams/:id', async (req, res) => {
   }
 });
 
-// GET /api/teams/:id/tryouts
 app.get('/api/teams/:id/tryouts', async (req, res) => {
   try {
     const tryouts = await Tryout.find({ coach_id: req.params.id }).sort({ created_at: 1 });
@@ -1300,7 +1572,6 @@ app.get('/api/teams/:id/tryouts', async (req, res) => {
   }
 });
 
-// GET /api/teams/:id/roster
 app.get('/api/teams/:id/roster', async (req, res) => {
   try {
     const players = await Player.find({ coach_id: req.params.id }).sort({ created_at: 1 });
@@ -1310,15 +1581,21 @@ app.get('/api/teams/:id/roster', async (req, res) => {
   }
 });
 
-// POST /api/teams/:id/roster
 app.post('/api/teams/:id/roster', async (req, res) => {
   try {
     const { name, jersey, gradYear, position, hw, city, state, email, cell } = req.body;
     if (!name) return res.status(400).json({ message: 'Player name is required' });
     const player = await Player.create({
-      coach_id: req.params.id, name, jersey,
-      grad_year: gradYear, position, hw, city, state,
-      email: email||'', cell: cell||''
+      coach_id:  req.params.id,
+      name,
+      jersey,
+      grad_year: gradYear,
+      position,
+      hw,
+      city,
+      state,
+      email:     email || '',
+      cell:      cell  || '',
     });
     upsertGHLPlayer({ name, email, cell, city, state, position, jersey, gradYear, hw });
     res.status(201).json({ message: 'Player registered', player: normalizePlayer(player) });
@@ -1327,7 +1604,6 @@ app.post('/api/teams/:id/roster', async (req, res) => {
   }
 });
 
-// PUT /api/teams/:id/roster/:playerId
 app.put('/api/teams/:id/roster/:playerId', requireAuth, async (req, res) => {
   try {
     const { name, jersey, gradYear, position, hw, city, state, email, cell } = req.body;
@@ -1344,7 +1620,6 @@ app.put('/api/teams/:id/roster/:playerId', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/teams/:id/roster/:playerId
 app.delete('/api/teams/:id/roster/:playerId', requireAuth, async (req, res) => {
   try {
     await Player.findOneAndDelete({ _id: req.params.playerId, coach_id: req.params.id });
@@ -1354,7 +1629,6 @@ app.delete('/api/teams/:id/roster/:playerId', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/teams/:id/schedule
 app.get('/api/teams/:id/schedule', async (req, res) => {
   try {
     const data = await Schedule.find({ coach_id: req.params.id }).sort({ date_sort: 1 });
@@ -1364,7 +1638,6 @@ app.get('/api/teams/:id/schedule', async (req, res) => {
   }
 });
 
-// GET /api/teams/:id/financials
 app.get('/api/teams/:id/financials', async (req, res) => {
   try {
     const data = await TeamFinancials.findOne({ coach_id: req.params.id });
@@ -1374,104 +1647,37 @@ app.get('/api/teams/:id/financials', async (req, res) => {
   }
 });
 
-// POST /api/teams/:id/tryout-registrations
 app.post('/api/teams/:id/tryout-registrations', async (req, res) => {
   try {
     const { completedBy, name, address, city, state, zip, cell, email,
             playerName, age, dob, hw, pos1, pos2, tryoutDate } = req.body;
     if (!name || !playerName) return res.status(400).json({ message: 'Name and player name are required' });
 
-    // Look up the tryout fee for this coach + date
-    let tryoutFeeStr = 'Free';
-    let tryoutFeeAmt = 0;
-    if (tryoutDate) {
-      const tryout = await Tryout.findOne({ coach_id: req.params.id, date: tryoutDate });
-      if (tryout && tryout.fee && tryout.fee !== 'Free') {
-        tryoutFeeStr = tryout.fee;
-        tryoutFeeAmt = parseFloat(tryout.fee.replace(/[^0-9.]/g, '')) || 0;
-      }
-    }
-    const isFree = tryoutFeeAmt === 0;
-
     const reg = await TryoutRegistration.create({
-      coach_id:          req.params.id,
-      completed_by:      completedBy||'', name,
-      address:           address||'', city: city||'', state: state||'', zip: zip||'',
-      cell:              cell||'', email: email||'',
-      player_name:       playerName, age: age||'', dob: dob||'', hw: hw||'',
-      pos1:              pos1||'', pos2: pos2||'', tryout_date: tryoutDate||'',
-      tryout_fee:        tryoutFeeStr,
-      tryout_fee_amount: tryoutFeeAmt,
-      payment_status:    isFree ? 'Free' : 'Pending',
+      coach_id:     req.params.id,
+      completed_by: completedBy || '',
+      name,
+      address:      address     || '',
+      city:         city        || '',
+      state:        state       || '',
+      zip:          zip         || '',
+      cell:         cell        || '',
+      email:        email       || '',
+      player_name:  playerName,
+      age:          age         || '',
+      dob:          dob         || '',
+      hw:           hw          || '',
+      pos1:         pos1        || '',
+      pos2:         pos2        || '',
+      tryout_date:  tryoutDate  || '',
     });
 
     const ghlResult = await upsertGHLContact({
       completedBy, name, address, city, state, zip, cell, email,
-      playerName, age, dob, hw, pos1, pos2, tryoutDate
+      playerName, age, dob, hw, pos1, pos2, tryoutDate,
     });
 
-    res.status(201).json({ message: 'Registration submitted', registration: reg, ghl: ghlResult, isFree, tryoutFeeAmt, regId: reg._id });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-
-
-// POST /api/stripe/create-tryout-checkout
-app.post('/api/stripe/create-tryout-checkout', async (req, res) => {
-  try {
-    if (!process.env.STRIPE_SECRET_KEY)
-      return res.status(500).json({ message: 'Stripe is not configured on this server.' });
-    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-    const { regId, feeAmount, playerName, playerEmail, teamId } = req.body;
-    if (!regId || !feeAmount || !teamId)
-      return res.status(400).json({ message: 'regId, feeAmount, and teamId are required' });
-    const amountCents = Math.round(parseFloat(feeAmount) * 100);
-    if (isNaN(amountCents) || amountCents < 50)
-      return res.status(400).json({ message: 'feeAmount must be at least $0.50' });
-
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      mode: 'payment',
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: 'Tryout Fee',
-            description: `Tryout registration fee for ${playerName || 'player'}`,
-          },
-          unit_amount: amountCents,
-        },
-        quantity: 1,
-      }],
-      success_url: `${FRONTEND_BASE}/team.html?id=${teamId}&tryout_payment=success&regId=${regId}`,
-      cancel_url:  `${FRONTEND_BASE}/team.html?id=${teamId}&tryout_payment=cancelled`,
-      metadata: { regId, teamId, type: 'tryout' },
-      ...(playerEmail ? { customer_email: playerEmail } : {}),
-    });
-
-    // Store session ID on the registration record
-    await TryoutRegistration.findByIdAndUpdate(regId, { stripe_session_id: session.id });
-
-    res.json({ url: session.url, sessionId: session.id });
-  } catch (err) {
-    console.error('Stripe tryout checkout error:', err);
-    res.status(500).json({ message: err.message || 'Stripe error' });
-  }
-});
-
-// PUT /api/coach/tryout-registrations/:id/mark-paid  (manual override by coach)
-app.put('/api/coach/tryout-registrations/:id/mark-paid', requireAuth, async (req, res) => {
-  try {
-    const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-    const reg = await TryoutRegistration.findOneAndUpdate(
-      { _id: req.params.id, coach_id: req.coachId },
-      { payment_status: 'Paid', payment_date: today },
-      { new: true }
-    );
-    if (!reg) return res.status(404).json({ message: 'Registration not found' });
-    res.json({ message: 'Marked as paid', registration: reg });
+    res.status(201).json({ message: 'Registration submitted', registration: reg, ghl: ghlResult });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
