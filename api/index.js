@@ -477,7 +477,7 @@ async function updateGHLProductAndPrice(productId, priceId, name, amount, recurr
       // Update product name so GHL UI stays readable
       axios.put(
         `https://services.leadconnectorhq.com/products/${productId}`,
-        { name, locationId: process.env.GHL_LOCATION_ID },
+        { name, locationId: process.env.GHL_LOCATION_ID, productType: 'SERVICE' },
         { headers: GHL_HEADERS() }
       ),
       // Update price amount (type is required by GHL even on updates)
