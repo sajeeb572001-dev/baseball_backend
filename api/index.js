@@ -441,6 +441,47 @@ async function deleteGHLProduct(productId) {
   }
 }
 
+/**
+ * Updates an existing GHL product name AND its price amount in parallel.
+ * Used when only dollar amounts change but the product structure stays the same
+ * (e.g. coach raises the player fee while keeping deposit OFF).
+ *
+ * Best-effort — logs a warning on failure but never throws, so the caller
+ * can still persist the existing IDs to MongoDB.
+ *
+ * @param {string} productId - Existing GHL product ID
+ * @param {string} priceId   - Existing GHL price ID
+ * @param {string} name      - New display name (contains updated dollar figure)
+ * @param {number} amount    - New dollar amount
+ */
+async function updateGHLProductAndPrice(productId, priceId, name, amount) {
+  if (!productId || !priceId) return;
+  try {
+    await Promise.all([
+      // Update product name so GHL UI stays readable
+      axios.put(
+        `https://services.leadconnectorhq.com/products/${productId}`,
+        { name, locationId: process.env.GHL_LOCATION_ID },
+        { headers: GHL_HEADERS() }
+      ),
+      // Update price amount on the same product
+      axios.put(
+        `https://services.leadconnectorhq.com/products/${productId}/price/${priceId}`,
+        {
+          locationId: process.env.GHL_LOCATION_ID,
+          name,
+          amount:     Number(amount),
+          currency:   'USD',
+        },
+        { headers: GHL_HEADERS() }
+      ),
+    ]);
+    console.log(`💱  GHL product+price updated: "${name}" → $${amount} (productId=${productId} priceId=${priceId})`);
+  } catch (err) {
+    console.warn(`⚠️  Could not update GHL product/price ${productId}/${priceId}:`, err.response?.data || err.message);
+  }
+}
+
 // ── GHL CONTACT UPSERT (tryout registration) ──────────────────
 async function upsertGHLContact({ completedBy, name, address, city, state, zip, cell, email,
                                    playerName, age, dob, hw, pos1, pos2, tryoutDate }) {
@@ -1063,9 +1104,6 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       ? Math.round((fee / months) * 100) / 100
       : fee;
 
-    // ── Did the player fee change since last save? ────────────
-    const feeChanged = !!existing && existing.player_fee !== fee;
-
     // ── Build the MongoDB update object ──────────────────────
     const update = {
       coach_id:           req.coachId,
@@ -1079,104 +1117,132 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
     };
 
     // ── GHL product/price sync ────────────────────────────────
+    //
+    // Rules (as per boss):
+    //   • Only amount changed, same structure  → UPDATE price in place (no delete/recreate)
+    //   • Structure changed (deposit toggle or monthly toggle) → DELETE old, CREATE new
+    //   • Product turned off                   → DELETE and clear IDs
+    //   • MongoDB is always kept in sync with whatever happened in GHL
     try {
-      // carry() returns the stored ID if fee is unchanged, '' if fee changed (forces recreation)
-      const carry = (field) => feeChanged ? '' : (existing?.[field] || '');
+      // ── Detect what changed since last save ───────────────
+      const isFirstSave       = !existing;
+      const depositToggled    = !isFirstSave && (!!existing.deposit_enabled !== !!depositEnabled);
+      const monthlyToggled    = !isFirstSave && (!!existing.monthly_payments !== !!monthlyPayments);
+      const feeChanged        = !isFirstSave && existing.player_fee !== fee;
+      const depositAmtChanged = !isFirstSave && existing.deposit_amount !== deposit;
 
-      update.ghl_product_full        = carry('ghl_product_full');
-      update.ghl_price_full          = carry('ghl_price_full');
-      update.ghl_product_deposit     = carry('ghl_product_deposit');
-      update.ghl_price_deposit       = carry('ghl_price_deposit');
-      update.ghl_product_remainder   = carry('ghl_product_remainder');
-      update.ghl_price_remainder     = carry('ghl_price_remainder');
-      update.ghl_product_installment = carry('ghl_product_installment');
-      update.ghl_price_installment   = carry('ghl_price_installment');
+      // ── Product name labels (amounts embedded for GHL readability) ─
+      const labelFull        = `${teamLabel} – Full Payment ($${fee})`;
+      const labelDeposit     = `${teamLabel} – Deposit ($${deposit})`;
+      const labelRemainder   = `${teamLabel} – Remaining Balance ($${remainder})`;
+      const labelInstallment = `${teamLabel} – Monthly Installment ($${installment}/mo × ${months})`;
 
-      // If fee changed, delete all old GHL products first
-      if (feeChanged && existing) {
-        console.log('💱  Fee changed — deleting old GHL products and recreating...');
-        await Promise.all([
-          deleteGHLProduct(existing.ghl_product_full),
-          deleteGHLProduct(existing.ghl_product_deposit),
-          deleteGHLProduct(existing.ghl_product_remainder),
-          deleteGHLProduct(existing.ghl_product_installment),
-        ]);
+      /**
+       * Syncs one GHL product according to desired state.
+       *
+       * Decision table:
+       *   want + (firstSave OR no IDs OR structureChanged) → CREATE  (returns new IDs)
+       *   want + existing IDs + amountChanged              → UPDATE  (returns same IDs)
+       *   want + existing IDs + nothing changed            → CARRY   (returns same IDs, no API call)
+       *   !want + existingProductId present                → DELETE  (returns empty IDs)
+       *   !want + no existingProductId                     → SKIP    (returns empty IDs)
+       *
+       * @returns {{ productId: string, priceId: string }}
+       */
+      async function syncProduct({
+        want, label, amount,
+        existingProductId, existingPriceId,
+        amountChanged, recurring = null, structureChanged,
+      }) {
+        if (want) {
+          const hasIds = !!(existingProductId && existingPriceId);
+
+          if (isFirstSave || !hasIds || structureChanged) {
+            // No existing product or structure changed → create fresh
+            if (amount > 0) {
+              const { productId, priceId } = await createGHLProductWithPrice(label, amount, recurring);
+              return { productId, priceId };
+            }
+            return { productId: '', priceId: '' };
+          }
+
+          if (amountChanged) {
+            // Same structure, only amounts changed → update price in place (no new product)
+            await updateGHLProductAndPrice(existingProductId, existingPriceId, label, amount);
+            return { productId: existingProductId, priceId: existingPriceId };
+          }
+
+          // Nothing changed → carry existing IDs (zero API calls)
+          return { productId: existingProductId, priceId: existingPriceId };
+
+        } else {
+          // Product should not exist — delete if one is stored
+          if (!isFirstSave && existingProductId) {
+            await deleteGHLProduct(existingProductId);
+          }
+          return { productId: '', priceId: '' };
+        }
       }
 
-      // ── Full pay product (ONLY when deposit is OFF) ───────
-      if (!depositEnabled) {
-        if (fee > 0 && !update.ghl_product_full) {
-          const { productId, priceId } = await createGHLProductWithPrice(
-            `${teamLabel} – Full Payment ($${fee})`,
-            fee
-          );
-          update.ghl_product_full = productId;
-          update.ghl_price_full   = priceId;
-        }
-      } else {
-        // Deposit is ON — full pay product is not needed; delete if it exists
-        if (existing?.ghl_product_full && !feeChanged) {
-          await deleteGHLProduct(existing.ghl_product_full);
-        }
-        update.ghl_product_full = '';
-        update.ghl_price_full   = '';
-      }
+      // ── Sync all four products ────────────────────────────
+      // Run in parallel: each product is independent in GHL.
+      const [fullResult, depositResult, remainderResult, installmentResult] = await Promise.all([
 
-      // ── Deposit product (ONLY when deposit is ON) ─────────
-      if (depositEnabled && deposit > 0) {
-        if (!update.ghl_product_deposit) {
-          const { productId, priceId } = await createGHLProductWithPrice(
-            `${teamLabel} – Deposit ($${deposit})`,
-            deposit
-          );
-          update.ghl_product_deposit = productId;
-          update.ghl_price_deposit   = priceId;
-        }
-      } else {
-        // Deposit toggled OFF — delete if it existed and this isn't a fee-change wipe
-        if (existing?.ghl_product_deposit && !feeChanged) {
-          await deleteGHLProduct(existing.ghl_product_deposit);
-        }
-        update.ghl_product_deposit = '';
-        update.ghl_price_deposit   = '';
-      }
+        // Full payment — exists ONLY when deposit is OFF
+        syncProduct({
+          want:              !depositEnabled,
+          label:             labelFull,
+          amount:            fee,
+          existingProductId: existing?.ghl_product_full,
+          existingPriceId:   existing?.ghl_price_full,
+          amountChanged:     feeChanged,
+          structureChanged:  depositToggled,   // deposit just toggled → delete old / create new
+        }),
 
-      // ── Remainder product (balance after deposit, ONLY when deposit is ON) ──
-      if (depositEnabled && remainder > 0) {
-        if (!update.ghl_product_remainder) {
-          const { productId, priceId } = await createGHLProductWithPrice(
-            `${teamLabel} – Remaining Balance ($${remainder})`,
-            remainder
-          );
-          update.ghl_product_remainder = productId;
-          update.ghl_price_remainder   = priceId;
-        }
-      } else {
-        if (existing?.ghl_product_remainder && !feeChanged) {
-          await deleteGHLProduct(existing.ghl_product_remainder);
-        }
-        update.ghl_product_remainder = '';
-        update.ghl_price_remainder   = '';
-      }
+        // Deposit — exists ONLY when deposit is ON
+        syncProduct({
+          want:              !!depositEnabled && deposit > 0,
+          label:             labelDeposit,
+          amount:            deposit,
+          existingProductId: existing?.ghl_product_deposit,
+          existingPriceId:   existing?.ghl_price_deposit,
+          amountChanged:     feeChanged || depositAmtChanged,
+          structureChanged:  depositToggled,
+        }),
 
-      // ── Monthly installment product ───────────────────────
-      if (monthlyPayments && installment > 0) {
-        if (!update.ghl_product_installment) {
-          const { productId, priceId } = await createGHLProductWithPrice(
-            `${teamLabel} – Monthly Installment ($${installment}/mo × ${months})`,
-            installment,
-            { interval: 'month', intervalCount: 1 }
-          );
-          update.ghl_product_installment = productId;
-          update.ghl_price_installment   = priceId;
-        }
-      } else {
-        if (existing?.ghl_product_installment && !feeChanged) {
-          await deleteGHLProduct(existing.ghl_product_installment);
-        }
-        update.ghl_product_installment = '';
-        update.ghl_price_installment   = '';
-      }
+        // Remaining balance — exists ONLY when deposit is ON
+        syncProduct({
+          want:              !!depositEnabled && remainder > 0,
+          label:             labelRemainder,
+          amount:            remainder,
+          existingProductId: existing?.ghl_product_remainder,
+          existingPriceId:   existing?.ghl_price_remainder,
+          amountChanged:     feeChanged || depositAmtChanged,  // remainder = fee - deposit
+          structureChanged:  depositToggled,
+        }),
+
+        // Monthly installment — exists ONLY when monthly is ON
+        syncProduct({
+          want:              !!monthlyPayments && installment > 0,
+          label:             labelInstallment,
+          amount:            installment,
+          existingProductId: existing?.ghl_product_installment,
+          existingPriceId:   existing?.ghl_price_installment,
+          amountChanged:     feeChanged,   // installment = fee / months
+          recurring:         { interval: 'month', intervalCount: 1 },
+          structureChanged:  monthlyToggled,
+        }),
+      ]);
+
+      // ── Mirror GHL state into MongoDB update object ───────
+      update.ghl_product_full        = fullResult.productId;
+      update.ghl_price_full          = fullResult.priceId;
+      update.ghl_product_deposit     = depositResult.productId;
+      update.ghl_price_deposit       = depositResult.priceId;
+      update.ghl_product_remainder   = remainderResult.productId;
+      update.ghl_price_remainder     = remainderResult.priceId;
+      update.ghl_product_installment = installmentResult.productId;
+      update.ghl_price_installment   = installmentResult.priceId;
 
     } catch (ghlErr) {
       // GHL errors are non-fatal — always fall through to the DB save
