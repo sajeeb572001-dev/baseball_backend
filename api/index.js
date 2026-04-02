@@ -454,8 +454,24 @@ async function deleteGHLProduct(productId) {
  * @param {string} name      - New display name (contains updated dollar figure)
  * @param {number} amount    - New dollar amount
  */
-async function updateGHLProductAndPrice(productId, priceId, name, amount) {
+async function updateGHLProductAndPrice(productId, priceId, name, amount, recurring = null) {
   if (!productId || !priceId) return;
+
+  // GHL requires `type` on both create AND update — omitting it causes a 422.
+  const pricePayload = {
+    locationId: process.env.GHL_LOCATION_ID,
+    name,
+    amount:     Number(amount),
+    currency:   'USD',
+    type:       recurring ? 'recurring' : 'one_time',
+  };
+  if (recurring) {
+    pricePayload.recurring = {
+      interval:      recurring.interval,
+      intervalCount: recurring.intervalCount,
+    };
+  }
+
   try {
     await Promise.all([
       // Update product name so GHL UI stays readable
@@ -464,15 +480,10 @@ async function updateGHLProductAndPrice(productId, priceId, name, amount) {
         { name, locationId: process.env.GHL_LOCATION_ID },
         { headers: GHL_HEADERS() }
       ),
-      // Update price amount on the same product
+      // Update price amount (type is required by GHL even on updates)
       axios.put(
         `https://services.leadconnectorhq.com/products/${productId}/price/${priceId}`,
-        {
-          locationId: process.env.GHL_LOCATION_ID,
-          name,
-          amount:     Number(amount),
-          currency:   'USD',
-        },
+        pricePayload,
         { headers: GHL_HEADERS() }
       ),
     ]);
@@ -1168,7 +1179,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
 
           if (amountChanged) {
             // Same structure, only amounts changed → update price in place (no new product)
-            await updateGHLProductAndPrice(existingProductId, existingPriceId, label, amount);
+            await updateGHLProductAndPrice(existingProductId, existingPriceId, label, amount, recurring);
             return { productId: existingProductId, priceId: existingPriceId };
           }
 
