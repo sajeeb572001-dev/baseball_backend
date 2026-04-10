@@ -1287,7 +1287,6 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
  */
 function monthsRemainingUntilDeadline(deadlineStr, now = new Date()) {
   if (!deadlineStr) return 1;
-  const now      = new Date();
   const deadline = new Date(deadlineStr);
   if (isNaN(deadline)) return 1;
 
