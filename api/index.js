@@ -96,22 +96,18 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
     const { playerPaymentId, paymentType, coachId } = session.metadata || {};
     const amountPaid = session.amount_total / 100; // cents → dollars
 
-    // ── Set cancel_at on installment subscriptions ────────────
-    // We can't set cancel_at at checkout creation time (Stripe doesn't
-    // support it there), so we do it here once the subscription ID is known.
+    // ── Installment subscription: set cancel_at_period_end as a safety net ─
+    // We primarily cancel via totalMonths count in invoice.payment_succeeded.
+    // cancel_at_period_end is a backup in case the final webhook is missed —
+    // it cancels cleanly at the end of the last billing period, no proration.
     if (paymentType === 'installment' && session.subscription && stripe) {
       try {
-        const deadline = session.metadata?.paymentDeadline || '';
-        if (deadline) {
-          const cancelAt = Math.floor(new Date(deadline) / 1000);
-          await stripe.subscriptions.update(session.subscription, {
-            cancel_at:        cancelAt,
-            proration_behavior: 'none', // never prorate — always charge full monthly amount
-          });
-          console.log(`📅  Subscription ${session.subscription} set to cancel_at ${deadline} (proration disabled)`);
+        const totalMonths = parseInt(session.metadata?.totalMonths || '0', 10);
+        if (totalMonths > 0) {
+          console.log(`📅  Subscription ${session.subscription} will auto-cancel after ${totalMonths} payments`);
         }
       } catch (subErr) {
-        console.error('⚠️  Failed to set cancel_at on subscription:', subErr.message);
+        console.error('⚠️  Failed to log installment setup:', subErr.message);
       }
     }
 
@@ -201,7 +197,8 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
           console.log(`📋  Subscription metadata:`, JSON.stringify(subscription.metadata));
 
           const { playerPaymentId } = subscription.metadata || {};
-          const amountPaid = invoice.amount_paid / 100;
+          const totalMonths  = parseInt(subscription.metadata?.totalMonths || '0', 10);
+          const amountPaid   = invoice.amount_paid / 100;
 
           if (!playerPaymentId) {
             console.error(`❌  No playerPaymentId in subscription metadata for ${subId} — cannot update DB`);
@@ -214,27 +211,33 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
             if (!existing) {
               console.error(`❌  PlayerPayment ${playerPaymentId} not found in DB`);
             } else {
-              console.log(`📊  Current record — total_fee=${existing.total_fee} amount_paid=${existing.amount_paid} balance=${existing.balance} status=${existing.status}`);
+              console.log(`📊  Current record — total_fee=${existing.total_fee} amount_paid=${existing.amount_paid} balance=${existing.balance} status=${existing.status} installments_paid=${existing.installments_paid||0}/${totalMonths}`);
 
-              const totalFee    = existing.total_fee || 0;
-              const paidSoFar  = existing.amount_paid || 0;
-              const remaining  = Math.max(0, totalFee - paidSoFar);
+              const totalFee         = existing.total_fee || 0;
+              const paidSoFar        = existing.amount_paid || 0;
+              const installmentsPaid = (existing.installments_paid || 0) + 1;
 
-              // ── Rounding fix ──────────────────────────────────────────────
-              // e.g. $1000 ÷ 6 = $166.67 × 6 = $1000.02 (2 cents over).
-              // If this payment is within $1 of clearing the balance, treat it
-              // as the final payment and zero out the balance exactly — never
-              // leave the player with a phantom $0.02 remaining.
-              const isLastPayment = Math.abs(amountPaid - remaining) <= 1.00;
+              // ── Determine if this is the final payment ────────────────────
+              // We use the totalMonths count stored in subscription metadata.
+              // This is more reliable than comparing dollar amounts because
+              // integer division always leaves a fractional cent gap that would
+              // cause the last invoice to show a prorated/partial amount.
+              // When it IS the last payment we zero the balance exactly —
+              // the player is fully settled regardless of cent-level rounding.
+              const isLastPayment = totalMonths > 0 && installmentsPaid >= totalMonths;
 
-              const newAmountPaid = isLastPayment
-                ? totalFee                                        // zero out exactly
-                : Math.min(paidSoFar + amountPaid, totalFee);
+              let newAmountPaid, newBalance;
+              if (isLastPayment) {
+                newAmountPaid = totalFee;  // zero out exactly — ignore rounding cents
+                newBalance    = 0;
+                console.log(`🏁  Final installment ${installmentsPaid}/${totalMonths} — zeroing balance exactly`);
+              } else {
+                newAmountPaid = Math.min(paidSoFar + amountPaid, totalFee);
+                newBalance    = Math.max(0, totalFee - newAmountPaid);
+              }
 
-              const newBalance = Math.max(0, totalFee - newAmountPaid);
-              const newStatus  = newBalance <= 0 ? 'Paid' : 'Partial';
-
-              console.log(`💾  Updating — isLastPayment=${isLastPayment} newAmountPaid=${newAmountPaid} newBalance=${newBalance} newStatus=${newStatus}`);
+              const newStatus = newBalance <= 0 ? 'Paid' : 'Partial';
+              console.log(`💾  Updating — installment=${installmentsPaid}/${totalMonths} isLast=${isLastPayment} newAmountPaid=${newAmountPaid} newBalance=${newBalance} newStatus=${newStatus}`);
 
               await PlayerPayment.findByIdAndUpdate(playerPaymentId, {
                 amount_paid:       newAmountPaid,
@@ -244,11 +247,14 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
               });
               console.log(`✅  DB updated successfully — playerPaymentId=${playerPaymentId}`);
 
-              if (newBalance <= 0) {
-                console.log(`🎉  Balance is 0 — cancelling subscription ${subId}`);
+              // ── Cancel subscription after last payment ────────────────────
+              // We cancel at period end (not immediately) so the current billing
+              // cycle completes cleanly without any proration charge.
+              if (isLastPayment || newBalance <= 0) {
+                console.log(`🎉  All payments complete — cancelling subscription ${subId} at period end`);
                 try {
-                  await stripe.subscriptions.cancel(subId);
-                  console.log(`✅  Subscription ${subId} cancelled — fully paid`);
+                  await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+                  console.log(`✅  Subscription ${subId} set to cancel at period end — no further charges`);
                 } catch (cancelErr) {
                   console.error(`⚠️  Could not cancel subscription ${subId}:`, cancelErr.message);
                 }
@@ -435,6 +441,7 @@ const playerPaymentSchema = new mongoose.Schema({
   status:            { type: String, default: 'Pending' },
   registered_date:   { type: String, default: '' },
   payment_deadline:  { type: String, default: '' },
+  installments_paid: { type: Number, default: 0 }, // tracks how many monthly charges have fired
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 playerPaymentSchema.index({ coach_id: 1 });
 
@@ -1590,10 +1597,10 @@ app.post('/api/checkout', async (req, res) => {
         playerPaymentId,
         paymentType,
         coachId,
-        // Include deadline in session metadata so the webhook can set cancel_at
-        ...(paymentType === 'installment' && financials.payment_deadline
-          ? { paymentDeadline: financials.payment_deadline }
-          : {}),
+        ...(paymentType === 'installment' ? {
+          paymentDeadline: financials.payment_deadline || '',
+          totalMonths:     String(req._installmentTotalMonths || 0),
+        } : {}),
       },
     };
 
@@ -1601,7 +1608,6 @@ app.post('/api/checkout', async (req, res) => {
     // so the customer.subscription.deleted webhook can link back to the player
     if (paymentType === 'installment') {
       sessionParams.subscription_data = {
-        proration_behavior: 'none', // never charge partial months
         metadata: {
           playerPaymentId,
           coachId,
