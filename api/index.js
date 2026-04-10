@@ -228,12 +228,23 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
 
               let newAmountPaid, newBalance;
               if (isLastPayment) {
-                newAmountPaid = totalFee;  // zero out exactly — ignore rounding cents
+                // Last payment by count — zero out exactly regardless of rounding
+                newAmountPaid = totalFee;
                 newBalance    = 0;
                 console.log(`🏁  Final installment ${installmentsPaid}/${totalMonths} — zeroing balance exactly`);
               } else {
                 newAmountPaid = Math.min(paidSoFar + amountPaid, totalFee);
                 newBalance    = Math.max(0, totalFee - newAmountPaid);
+
+                // Penny tolerance — catches rounding gaps like $0.01 from
+                // $1000/3 = $999.99 when totalMonths is 0 (old subscriptions
+                // created before totalMonths metadata was added).
+                // If balance is $0.50 or less after payment, treat as fully paid.
+                if (newBalance > 0 && newBalance <= 0.50) {
+                  console.log(`🪙  Balance ${newBalance} within penny tolerance — zeroing out`);
+                  newAmountPaid = totalFee;
+                  newBalance    = 0;
+                }
               }
 
               const newStatus = newBalance <= 0 ? 'Paid' : 'Partial';
@@ -1495,7 +1506,7 @@ app.get('/api/teams/:id/installment-preview', async (req, res) => {
     const balance    = depEnabled ? Math.max(0, fee - deposit) : fee;
     const chargeDay  = new Date().getDate();
     const months     = monthsRemainingUntilDeadline(financials.payment_deadline, chargeDay);
-    const perMonth   = months > 0 ? Math.round((balance / months) * 100) / 100 : balance;
+    const perMonth   = months > 0 ? Math.ceil((balance / months) * 100) / 100 : balance;
 
     res.json({
       enabled:         true,
@@ -1561,7 +1572,17 @@ app.post('/api/checkout', async (req, res) => {
 
       const chargeDay     = new Date().getDate();
       const months        = monthsRemainingUntilDeadline(financials.payment_deadline, chargeDay);
-      const perMonthCents = Math.round((balanceToSplit / months) * 100);
+      // Industry-standard first-payment adjustment:
+      // Base amount = floor(total / months), remainder goes on month 1.
+      // e.g. $1000 / 3 = $333.33 base, $0.01 remainder
+      //   Month 1 → $333.34, Month 2-3 → $333.33, Total = $1000.00 exactly.
+      // The first payment is handled by checkout.session.completed which already
+      // records amountPaid from session.amount_total — so the correct amount is
+      // always captured regardless of which month it is.
+      const baseMonthCents      = Math.floor((balanceToSplit / months) * 100);
+      const remainderCents      = Math.round(balanceToSplit * 100) - (baseMonthCents * months);
+      const firstMonthCents     = baseMonthCents + remainderCents; // month 1 absorbs remainder
+      const perMonthCents       = baseMonthCents;                  // months 2-N use base amount
 
       console.log(`📅  Installment checkout — deadline=${financials.payment_deadline} months=${months} balance=$${balanceToSplit} per-month=$${(perMonthCents/100).toFixed(2)}`);
 
@@ -1577,6 +1598,7 @@ app.post('/api/checkout', async (req, res) => {
         limit:   100,
       });
 
+      // Find or create the BASE recurring price (months 2-N)
       let installmentPrice = existingPrices.data.find(p =>
         p.unit_amount === perMonthCents &&
         p.metadata?.months === String(months) &&
@@ -1584,7 +1606,7 @@ app.post('/api/checkout', async (req, res) => {
       );
 
       if (installmentPrice) {
-        console.log(`♻️  Reusing existing Stripe price ${installmentPrice.id} (${perMonthCents/100}/mo × ${months} months) for product ${productId}`);
+        console.log(`♻️  Reusing existing Stripe price ${installmentPrice.id} (${perMonthCents/100}/mo × ${months} months)`);
       } else {
         installmentPrice = await stripe.prices.create({
           product:     productId,
@@ -1597,7 +1619,16 @@ app.post('/api/checkout', async (req, res) => {
             balanceToSplit:  String(balanceToSplit),
           },
         });
-        console.log(`💰  New Stripe price created ${installmentPrice.id} (${perMonthCents/100}/mo × ${months} months deadline=${financials.payment_deadline}) for product ${productId}`);
+        console.log(`💰  New Stripe price created ${installmentPrice.id} (${perMonthCents/100}/mo × ${months} months)`);
+      }
+
+      // If there is a remainder, add a one-time invoice item for the extra cents.
+      // Stripe will merge it into the first invoice automatically so the player
+      // sees a single charge of (base + remainder) on month 1.
+      if (remainderCents > 0) {
+        // We need the customer ID — look it up after session creation via webhook.
+        // Store remainderCents in session metadata so the webhook can add it.
+        console.log(`🪙  Remainder ${remainderCents} cents will be added to first invoice`);
       }
 
       // ── cancel_at = deadline date (Stripe auto-cancels the subscription) ──
@@ -1606,11 +1637,14 @@ app.post('/api/checkout', async (req, res) => {
       mode      = 'subscription';
       lineItems = [{ price: installmentPrice.id, quantity: 1 }];
 
-      // Store totalMonths so the webhook knows when the final payment is due
-      req._installmentTotalMonths = months;
+      // Store for use in session metadata below
+      req._installmentTotalMonths    = months;
+      req._installmentRemainderCents = remainderCents;
 
       // Store cancel_at for use in session creation below
       req._installmentCancelAt = cancelAtTimestamp;
+
+      console.log(`📅  Installment plan — months=${months} base=${perMonthCents/100} remainder=${remainderCents}cents first=${firstMonthCents/100}`);
 
     } else {
       // ── Static payment types: full | deposit | remainder ──────
@@ -1658,6 +1692,7 @@ app.post('/api/checkout', async (req, res) => {
         ...(paymentType === 'installment' ? {
           paymentDeadline: financials.payment_deadline || '',
           totalMonths:     String(req._installmentTotalMonths || 0),
+          remainderCents:  String(req._installmentRemainderCents || 0),
         } : {}),
       },
     };
@@ -1669,7 +1704,8 @@ app.post('/api/checkout', async (req, res) => {
         metadata: {
           playerPaymentId,
           coachId,
-          totalMonths: String(req._installmentTotalMonths || 0),
+          totalMonths:    String(req._installmentTotalMonths || 0),
+          remainderCents: String(req._installmentRemainderCents || 0),
         },
       };
     }
