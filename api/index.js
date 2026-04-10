@@ -152,48 +152,81 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
     }
   }
 
-  // ── Monthly installment payment succeeded (every charge AFTER the first) ──
-  // checkout.session.completed already handles the very first payment (billing_reason = 'subscription_create').
-  // invoice.payment_succeeded fires for all subsequent monthly renewals, so we skip the first one here.
-  if (event.type === 'invoice.payment_succeeded') {
-    const invoice = event.data.object;
+  // ── Monthly installment payment succeeded ─────────────────────────────────
+  // Handles both old API (invoice.payment_succeeded) and new API (invoice_payment.paid)
+  // invoice_payment.paid was introduced in Stripe API version 2026-02-25
+  if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice_payment.paid') {
+    const isNewFormat = event.type === 'invoice_payment.paid';
+    const rawObj      = event.data.object;
 
-    // Skip the first charge — checkout.session.completed already recorded it
-    if (invoice.billing_reason === 'subscription_create') {
-      console.log(`⏭️  invoice.payment_succeeded skipped (subscription_create — already handled by checkout.session.completed)`);
+    // invoice_payment.paid has a different shape — fetch the parent invoice
+    // to get billing_reason and subscription ID
+    let invoice;
+    if (isNewFormat) {
+      try {
+        invoice = await stripe.invoices.retrieve(rawObj.invoice);
+        console.log(`🔔  invoice_payment.paid — invoice=${rawObj.invoice} amount=${rawObj.amount_paid} billing_reason=${invoice.billing_reason} sub=${invoice.subscription}`);
+      } catch (fetchErr) {
+        console.error('❌  Could not fetch invoice for invoice_payment.paid:', fetchErr.message);
+        return res.json({ received: true });
+      }
     } else {
-      // Pull playerPaymentId from the subscription's metadata
-      const subId = invoice.subscription;
-      if (subId && stripe) {
-        try {
-          const subscription     = await stripe.subscriptions.retrieve(subId);
-          const { playerPaymentId } = subscription.metadata || {};
-          const amountPaid       = invoice.amount_paid / 100; // cents → dollars
+      invoice = rawObj;
+      console.log(`🔔  invoice.payment_succeeded — billing_reason=${invoice.billing_reason} amount=${invoice.amount_paid} sub=${invoice.subscription}`);
+    }
 
-          if (playerPaymentId && amountPaid > 0) {
+    if (invoice.billing_reason === 'subscription_create') {
+      console.log(`⏭️  Skipping — first charge already handled by checkout.session.completed`);
+    } else {
+      const subId = invoice.subscription;
+      console.log(`🔍  Looking up subscription: ${subId}`);
+
+      if (!subId) {
+        console.error('❌  No subscription ID on invoice — cannot process');
+      } else if (!stripe) {
+        console.error('❌  Stripe not initialised');
+      } else {
+        try {
+          const subscription = await stripe.subscriptions.retrieve(subId);
+          console.log(`📋  Subscription metadata:`, JSON.stringify(subscription.metadata));
+
+          const { playerPaymentId } = subscription.metadata || {};
+          const amountPaid = invoice.amount_paid / 100;
+
+          if (!playerPaymentId) {
+            console.error(`❌  No playerPaymentId in subscription metadata for ${subId} — cannot update DB`);
+          } else if (amountPaid <= 0) {
+            console.warn(`⚠️  amountPaid is ${amountPaid} — skipping`);
+          } else {
+            console.log(`🔎  Looking up PlayerPayment: ${playerPaymentId}`);
             const existing = await PlayerPayment.findById(playerPaymentId);
-            if (existing) {
+
+            if (!existing) {
+              console.error(`❌  PlayerPayment ${playerPaymentId} not found in DB`);
+            } else {
+              console.log(`📊  Current record — total_fee=${existing.total_fee} amount_paid=${existing.amount_paid} balance=${existing.balance} status=${existing.status}`);
+
               const newAmountPaid = Math.min(
                 (existing.amount_paid || 0) + amountPaid,
-                existing.total_fee || 0           // never exceed total_fee
+                existing.total_fee || 0
               );
               const newBalance = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
               const newStatus  = newBalance <= 0 ? 'Paid' : 'Partial';
+
+              console.log(`💾  Updating — newAmountPaid=${newAmountPaid} newBalance=${newBalance} newStatus=${newStatus}`);
 
               await PlayerPayment.findByIdAndUpdate(playerPaymentId, {
                 amount_paid: newAmountPaid,
                 balance:     newBalance,
                 status:      newStatus,
               });
-              console.log(`✅  Installment recorded — playerPaymentId=${playerPaymentId} +$${amountPaid} paid=$${newAmountPaid} balance=$${newBalance} status=${newStatus}`);
+              console.log(`✅  DB updated successfully — playerPaymentId=${playerPaymentId}`);
 
-              // ── Auto-cancel subscription once fully paid ──────────
-              // If the player has paid in full before the deadline, cancel
-              // the Stripe subscription immediately so they are never charged again.
               if (newBalance <= 0) {
+                console.log(`🎉  Balance is 0 — cancelling subscription ${subId}`);
                 try {
                   await stripe.subscriptions.cancel(subId);
-                  console.log(`🎉  Subscription ${subId} cancelled — fully paid (balance=0)`);
+                  console.log(`✅  Subscription ${subId} cancelled — fully paid`);
                 } catch (cancelErr) {
                   console.error(`⚠️  Could not cancel subscription ${subId}:`, cancelErr.message);
                 }
@@ -202,6 +235,7 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
           }
         } catch (err) {
           console.error('❌  Failed to process invoice.payment_succeeded:', err.message);
+          console.error(err.stack);
         }
       }
     }
