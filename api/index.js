@@ -1428,7 +1428,8 @@ app.post('/api/checkout', async (req, res) => {
     // ── Build checkout session ────────────────────────────────
     let lineItems;
     let mode;
-    let months = 0; // populated for installment type, used in session metadata
+    let months            = 0;
+    let perMonthCentsOuter = 0; // set inside installment block, used in session metadata
 
     if (paymentType === 'installment') {
       // ── DYNAMIC installment: calculate months remaining for this player ──
@@ -1459,6 +1460,7 @@ app.post('/api/checkout', async (req, res) => {
       // Use registrationNow (real or simulated) for month calculation
       months              = monthsRemainingUntilDeadline(financials.payment_deadline, registrationNow);
       const perMonthCents = Math.round((balanceToSplit / months) * 100);
+      perMonthCentsOuter  = perMonthCents;
 
       console.log(`📅  Installment checkout — date=${registrationNow.toISOString()} deadline=${financials.payment_deadline} months=${months} balance=$${balanceToSplit} per-month=$${(perMonthCents/100).toFixed(2)}${testClockCustomerId ? ' [TEST CLOCK]' : ''}`);
 
@@ -1536,7 +1538,7 @@ app.post('/api/checkout', async (req, res) => {
         coachId,
         ...(paymentType === 'installment' ? {
           installmentMonths: String(months),
-          perMonthCents:     String(Math.round((balanceToSplit / months) * 100)),
+          perMonthCents:     String(perMonthCentsOuter),
         } : {}),
       },
     };
