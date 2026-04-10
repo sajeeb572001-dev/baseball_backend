@@ -162,7 +162,8 @@ const coachSchema = new mongoose.Schema({
   phone_public: { type: String, default: '' },
   bio:          { type: String, default: '' },
   image_url:    { type: String, default: '' },
-  team_details: { type: String, default: '' },
+  team_details:     { type: String,  default: '' },
+  register_enabled: { type: Boolean, default: true },
   assistant1:   { type: mongoose.Schema.Types.Mixed, default: {} },
   assistant2:   { type: mongoose.Schema.Types.Mixed, default: {} },
   active:             { type: Boolean, default: true },
@@ -206,16 +207,32 @@ const tryoutRegistrationSchema = new mongoose.Schema({
 tryoutRegistrationSchema.index({ coach_id: 1 });
 
 const playerSchema = new mongoose.Schema({
-  coach_id:  { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
-  name:      { type: String, required: true },
-  jersey:    { type: String, default: '' },
-  grad_year: { type: String, default: '' },
-  position:  { type: String, default: '' },
-  hw:        { type: String, default: '' },
-  city:      { type: String, default: '' },
-  state:     { type: String, default: '' },
-  email:     { type: String, default: '' },
-  cell:      { type: String, default: '' },
+  coach_id:         { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
+  name:             { type: String, required: true },
+  jersey:           { type: String, default: '' },
+  jersey_2:         { type: String, default: '' },
+  grad_year:        { type: String, default: '' },
+  position:         { type: String, default: '' },
+  pos2:             { type: String, default: '' },
+  hw:               { type: String, default: '' },
+  city:             { type: String, default: '' },
+  state:            { type: String, default: '' },
+  address:          { type: String, default: '' },
+  zip:              { type: String, default: '' },
+  email:            { type: String, default: '' },
+  cell:             { type: String, default: '' },
+  dob:              { type: String, default: '' },
+  bats:             { type: String, default: '' },
+  throws:           { type: String, default: '' },
+  high_school:      { type: String, default: '' },
+  mother_first:     { type: String, default: '' },
+  mother_last:      { type: String, default: '' },
+  mother_cell:      { type: String, default: '' },
+  mother_email:     { type: String, default: '' },
+  father_first:     { type: String, default: '' },
+  father_last:      { type: String, default: '' },
+  father_cell:      { type: String, default: '' },
+  father_email:     { type: String, default: '' },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 playerSchema.index({ coach_id: 1 });
 
@@ -391,6 +408,7 @@ async function createGHLProductWithPrice(name, amount, recurring = null) {
     amount:     Number(amount),
     currency:   'USD',
     type:       recurring ? 'recurring' : 'one_time',
+    active:     true,
   };
 
   if (recurring) {
@@ -438,58 +456,6 @@ async function deleteGHLProduct(productId) {
     console.log(`🗑️  GHL product deleted: ${productId}`);
   } catch (err) {
     console.warn(`⚠️  Could not delete GHL product ${productId}:`, err.response?.data || err.message);
-  }
-}
-
-/**
- * Updates an existing GHL product name AND its price amount in parallel.
- * Used when only dollar amounts change but the product structure stays the same
- * (e.g. coach raises the player fee while keeping deposit OFF).
- *
- * Best-effort — logs a warning on failure but never throws, so the caller
- * can still persist the existing IDs to MongoDB.
- *
- * @param {string} productId - Existing GHL product ID
- * @param {string} priceId   - Existing GHL price ID
- * @param {string} name      - New display name (contains updated dollar figure)
- * @param {number} amount    - New dollar amount
- */
-async function updateGHLProductAndPrice(productId, priceId, name, amount, recurring = null) {
-  if (!productId || !priceId) return;
-
-  // GHL requires `type` on both create AND update — omitting it causes a 422.
-  const pricePayload = {
-    locationId: process.env.GHL_LOCATION_ID,
-    name,
-    amount:     Number(amount),
-    currency:   'USD',
-    type:       recurring ? 'recurring' : 'one_time',
-  };
-  if (recurring) {
-    pricePayload.recurring = {
-      interval:      recurring.interval,
-      intervalCount: recurring.intervalCount,
-    };
-  }
-
-  try {
-    await Promise.all([
-      // Update product name so GHL UI stays readable
-      axios.put(
-        `https://services.leadconnectorhq.com/products/${productId}`,
-        { name, locationId: process.env.GHL_LOCATION_ID, productType: 'SERVICE' },
-        { headers: GHL_HEADERS() }
-      ),
-      // Update price amount (type is required by GHL even on updates)
-      axios.put(
-        `https://services.leadconnectorhq.com/products/${productId}/price/${priceId}`,
-        pricePayload,
-        { headers: GHL_HEADERS() }
-      ),
-    ]);
-    console.log(`💱  GHL product+price updated: "${name}" → $${amount} (productId=${productId} priceId=${priceId})`);
-  } catch (err) {
-    console.warn(`⚠️  Could not update GHL product/price ${productId}/${priceId}:`, err.response?.data || err.message);
   }
 }
 
@@ -541,31 +507,58 @@ async function upsertGHLContact({ completedBy, name, address, city, state, zip, 
 }
 
 // ── GHL PLAYER UPSERT ─────────────────────────────────────────
-async function upsertGHLPlayer({ name, email, cell, city, state, position, jersey, gradYear, hw }) {
+async function upsertGHLPlayer({
+  name, email, cell, dob, bats, throws, hw,
+  jersey, jersey2, gradYear, position, pos2,
+  address, city, state, zip, highSchool,
+  motherFirst, motherLast, motherCell, motherEmail,
+  fatherFirst, fatherLast, fatherCell, fatherEmail,
+  teamName,
+}) {
   if (!process.env.GHL_API_KEY || !process.env.GHL_LOCATION_ID) return;
-  const nameParts = (name || '').trim().split(' ');
   try {
     await axios.post(
       'https://services.leadconnectorhq.com/contacts/upsert',
       {
         locationId: process.env.GHL_LOCATION_ID,
-        firstName:  nameParts[0] || '',
-        lastName:   nameParts.slice(1).join(' ') || '',
-        email:  email || '',
-        phone:  cell  || '',
-        city:   city  || '',
-        state:  state || '',
-        tags:   ['Player'],
+        // Contact main identity = Father
+        firstName:  fatherFirst  || '',
+        lastName:   fatherLast   || '',
+        email:      fatherEmail  || '',
+        phone:      fatherCell   || '',
+        // Address = Player's address
+        address1:   address      || '',
+        city:       city         || '',
+        state:      state        || '',
+        postalCode: zip          || '',
+        tags: ['Player'],
         customFields: [
-          { key: 'players_name',  value: name     || '' },
-          { key: 'position',      value: position || '' },
-          { key: 'grad_year',     value: gradYear || '' },
-          { key: 'jersey_number', value: jersey   || '' },
-          { key: 'ht__wt',        value: hw       || '' },
+          // Player info
+          { key: 'players_name',      value: name         || '' },
+          { key: 'player_dob',        value: dob          || '' },
+          { key: 'player_email',      value: email        || '' },
+          { key: 'player_cell',       value: cell         || '' },
+          { key: 'bats',              value: bats         || '' },
+          { key: 'throws',            value: throws       || '' },
+          { key: 'jersey_number_1',   value: jersey       || '' },
+          { key: 'jersey_number_2',   value: jersey2      || '' },
+          { key: 'htwt',              value: hw           || '' },
+          { key: 'grad_year',         value: gradYear     || '' },
+          { key: 'high_school',       value: highSchool   || '' },
+          { key: 'player_address',    value: address      || '' },
+          { key: 'position1',         value: position     || '' },
+          { key: 'position2',         value: pos2         || '' },
+          { key: 'team_name',         value: teamName     || '' },
+          // Mother info
+          { key: 'mother_first_name', value: motherFirst  || '' },
+          { key: 'mother_last_name',  value: motherLast   || '' },
+          { key: 'mother_cell',       value: motherCell   || '' },
+          { key: 'mother_email',      value: motherEmail  || '' },
         ],
       },
       { headers: GHL_HEADERS() }
     );
+    console.log(`✅  GHL player upserted: ${fatherFirst} ${fatherLast} (${fatherEmail})`);
   } catch (err) {
     console.error('GHL player upsert error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
   }
@@ -646,7 +639,8 @@ function normalizeCoach(c) {
     state:       c.state        || '',
     location:    c.location     || '',
     ageGroup:    c.age_group    || '',
-    teamDetails: c.team_details || '',
+    teamDetails:    c.team_details     || '',
+    registerEnabled: c.register_enabled !== false,
     assistant1:  c.assistant1   || {},
     assistant2:  c.assistant2   || {},
   };
@@ -666,16 +660,32 @@ function normalizeTryout(t) {
 
 function normalizePlayer(p) {
   return {
-    _id:      p._id,
-    name:     p.name      || '',
-    jersey:   p.jersey    || '',
-    gradYear: p.grad_year || '',
-    position: p.position  || '',
-    hw:       p.hw        || '',
-    city:     p.city      || '',
-    state:    p.state     || '',
-    email:    p.email     || '',
-    cell:     p.cell      || '',
+    _id:          p._id,
+    name:         p.name         || '',
+    jersey:       p.jersey       || '',
+    jersey2:      p.jersey_2     || '',
+    gradYear:     p.grad_year    || '',
+    position:     p.position     || '',
+    pos2:         p.pos2         || '',
+    hw:           p.hw           || '',
+    city:         p.city         || '',
+    state:        p.state        || '',
+    address:      p.address      || '',
+    zip:          p.zip          || '',
+    email:        p.email        || '',
+    cell:         p.cell         || '',
+    dob:          p.dob          || '',
+    bats:         p.bats         || '',
+    throws:       p.throws       || '',
+    highSchool:   p.high_school  || '',
+    motherFirst:  p.mother_first || '',
+    motherLast:   p.mother_last  || '',
+    motherCell:   p.mother_cell  || '',
+    motherEmail:  p.mother_email || '',
+    fatherFirst:  p.father_first || '',
+    fatherLast:   p.father_last  || '',
+    fatherCell:   p.father_cell  || '',
+    fatherEmail:  p.father_email || '',
   };
 }
 
@@ -736,7 +746,7 @@ app.post('/api/coach/register', async (req, res) => {
       phone_public: phone,
     });
 
-    upsertGHLCoach({ firstName, lastName, email, phone, teamName });
+    await upsertGHLCoach({ firstName, lastName, email, phone, teamName });
     res.status(201).json({ message: 'Account created successfully' });
   } catch (err) {
     console.error(err);
@@ -854,6 +864,7 @@ app.put('/api/coach/update-profile', requireAuth, async (req, res) => {
       location:    'location',
       ageGroup:    'age_group',
       teamDetails: 'team_details',
+      registerEnabled: 'register_enabled',
     };
     const update = {};
     Object.entries(map).forEach(([jsKey, dbKey]) => {
@@ -864,7 +875,7 @@ app.put('/api/coach/update-profile', requireAuth, async (req, res) => {
     const coach = await Coach.findByIdAndUpdate(req.coachId, update, { new: true }).select('-password');
     if (!coach) return res.status(404).json({ message: 'Coach not found' });
 
-    upsertGHLCoach({
+    await upsertGHLCoach({
       firstName: coach.first_name,
       lastName:  coach.last_name,
       email:     coach.email_public,
@@ -1115,6 +1126,9 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       ? Math.round((fee / months) * 100) / 100
       : fee;
 
+    // ── Did the player fee change since last save? ────────────
+    const feeChanged = !!existing && existing.player_fee !== fee;
+
     // ── Build the MongoDB update object ──────────────────────
     const update = {
       coach_id:           req.coachId,
@@ -1128,132 +1142,104 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
     };
 
     // ── GHL product/price sync ────────────────────────────────
-    //
-    // Rules (as per boss):
-    //   • Only amount changed, same structure  → UPDATE price in place (no delete/recreate)
-    //   • Structure changed (deposit toggle or monthly toggle) → DELETE old, CREATE new
-    //   • Product turned off                   → DELETE and clear IDs
-    //   • MongoDB is always kept in sync with whatever happened in GHL
     try {
-      // ── Detect what changed since last save ───────────────
-      const isFirstSave       = !existing;
-      const depositToggled    = !isFirstSave && (!!existing.deposit_enabled !== !!depositEnabled);
-      const monthlyToggled    = !isFirstSave && (!!existing.monthly_payments !== !!monthlyPayments);
-      const feeChanged        = !isFirstSave && existing.player_fee !== fee;
-      const depositAmtChanged = !isFirstSave && existing.deposit_amount !== deposit;
+      // carry() returns the stored ID if fee is unchanged, '' if fee changed (forces recreation)
+      const carry = (field) => feeChanged ? '' : (existing?.[field] || '');
 
-      // ── Product name labels (amounts embedded for GHL readability) ─
-      const labelFull        = `${teamLabel} – Full Payment ($${fee})`;
-      const labelDeposit     = `${teamLabel} – Deposit ($${deposit})`;
-      const labelRemainder   = `${teamLabel} – Remaining Balance ($${remainder})`;
-      const labelInstallment = `${teamLabel} – Monthly Installment ($${installment}/mo × ${months})`;
+      update.ghl_product_full        = carry('ghl_product_full');
+      update.ghl_price_full          = carry('ghl_price_full');
+      update.ghl_product_deposit     = carry('ghl_product_deposit');
+      update.ghl_price_deposit       = carry('ghl_price_deposit');
+      update.ghl_product_remainder   = carry('ghl_product_remainder');
+      update.ghl_price_remainder     = carry('ghl_price_remainder');
+      update.ghl_product_installment = carry('ghl_product_installment');
+      update.ghl_price_installment   = carry('ghl_price_installment');
 
-      /**
-       * Syncs one GHL product according to desired state.
-       *
-       * Decision table:
-       *   want + (firstSave OR no IDs OR structureChanged) → CREATE  (returns new IDs)
-       *   want + existing IDs + amountChanged              → UPDATE  (returns same IDs)
-       *   want + existing IDs + nothing changed            → CARRY   (returns same IDs, no API call)
-       *   !want + existingProductId present                → DELETE  (returns empty IDs)
-       *   !want + no existingProductId                     → SKIP    (returns empty IDs)
-       *
-       * @returns {{ productId: string, priceId: string }}
-       */
-      async function syncProduct({
-        want, label, amount,
-        existingProductId, existingPriceId,
-        amountChanged, recurring = null, structureChanged,
-      }) {
-        if (want) {
-          const hasIds = !!(existingProductId && existingPriceId);
-
-          if (isFirstSave || !hasIds || structureChanged) {
-            // No existing product or structure changed → create fresh
-            if (amount > 0) {
-              const { productId, priceId } = await createGHLProductWithPrice(label, amount, recurring);
-              return { productId, priceId };
-            }
-            return { productId: '', priceId: '' };
-          }
-
-          if (amountChanged) {
-            // Same structure, only amounts changed → update price in place (no new product)
-            await updateGHLProductAndPrice(existingProductId, existingPriceId, label, amount, recurring);
-            return { productId: existingProductId, priceId: existingPriceId };
-          }
-
-          // Nothing changed → carry existing IDs (zero API calls)
-          return { productId: existingProductId, priceId: existingPriceId };
-
-        } else {
-          // Product should not exist — delete if one is stored
-          if (!isFirstSave && existingProductId) {
-            await deleteGHLProduct(existingProductId);
-          }
-          return { productId: '', priceId: '' };
-        }
+      // If fee changed, delete all old GHL products first
+      if (feeChanged && existing) {
+        console.log('💱  Fee changed — deleting old GHL products and recreating...');
+        await Promise.all([
+          deleteGHLProduct(existing.ghl_product_full),
+          deleteGHLProduct(existing.ghl_product_deposit),
+          deleteGHLProduct(existing.ghl_product_remainder),
+          deleteGHLProduct(existing.ghl_product_installment),
+        ]);
       }
 
-      // ── Sync all four products ────────────────────────────
-      // Run in parallel: each product is independent in GHL.
-      const [fullResult, depositResult, remainderResult, installmentResult] = await Promise.all([
+      // ── Full pay product (ONLY when deposit is OFF) ───────
+      if (!depositEnabled) {
+        if (fee > 0 && !update.ghl_product_full) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Full Payment ($${fee})`,
+            fee
+          );
+          update.ghl_product_full = productId;
+          update.ghl_price_full   = priceId;
+        }
+      } else {
+        // Deposit is ON — full pay product is not needed; delete if it exists
+        if (existing?.ghl_product_full && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_full);
+        }
+        update.ghl_product_full = '';
+        update.ghl_price_full   = '';
+      }
 
-        // Full payment — exists ONLY when deposit is OFF
-        syncProduct({
-          want:              !depositEnabled,
-          label:             labelFull,
-          amount:            fee,
-          existingProductId: existing?.ghl_product_full,
-          existingPriceId:   existing?.ghl_price_full,
-          amountChanged:     feeChanged,
-          structureChanged:  depositToggled,   // deposit just toggled → delete old / create new
-        }),
+      // ── Deposit product (ONLY when deposit is ON) ─────────
+      if (depositEnabled && deposit > 0) {
+        if (!update.ghl_product_deposit) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Deposit ($${deposit})`,
+            deposit
+          );
+          update.ghl_product_deposit = productId;
+          update.ghl_price_deposit   = priceId;
+        }
+      } else {
+        // Deposit toggled OFF — delete if it existed and this isn't a fee-change wipe
+        if (existing?.ghl_product_deposit && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_deposit);
+        }
+        update.ghl_product_deposit = '';
+        update.ghl_price_deposit   = '';
+      }
 
-        // Deposit — exists ONLY when deposit is ON
-        syncProduct({
-          want:              !!depositEnabled && deposit > 0,
-          label:             labelDeposit,
-          amount:            deposit,
-          existingProductId: existing?.ghl_product_deposit,
-          existingPriceId:   existing?.ghl_price_deposit,
-          amountChanged:     feeChanged || depositAmtChanged,
-          structureChanged:  depositToggled,
-        }),
+      // ── Remainder product (balance after deposit, ONLY when deposit is ON) ──
+      if (depositEnabled && remainder > 0) {
+        if (!update.ghl_product_remainder) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Remaining Balance ($${remainder})`,
+            remainder
+          );
+          update.ghl_product_remainder = productId;
+          update.ghl_price_remainder   = priceId;
+        }
+      } else {
+        if (existing?.ghl_product_remainder && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_remainder);
+        }
+        update.ghl_product_remainder = '';
+        update.ghl_price_remainder   = '';
+      }
 
-        // Remaining balance — exists ONLY when deposit is ON
-        syncProduct({
-          want:              !!depositEnabled && remainder > 0,
-          label:             labelRemainder,
-          amount:            remainder,
-          existingProductId: existing?.ghl_product_remainder,
-          existingPriceId:   existing?.ghl_price_remainder,
-          amountChanged:     feeChanged || depositAmtChanged,  // remainder = fee - deposit
-          structureChanged:  depositToggled,
-        }),
-
-        // Monthly installment — exists ONLY when monthly is ON
-        syncProduct({
-          want:              !!monthlyPayments && installment > 0,
-          label:             labelInstallment,
-          amount:            installment,
-          existingProductId: existing?.ghl_product_installment,
-          existingPriceId:   existing?.ghl_price_installment,
-          amountChanged:     feeChanged,   // installment = fee / months
-          recurring:         { interval: 'month', intervalCount: 1 },
-          structureChanged:  monthlyToggled,
-        }),
-      ]);
-
-      // ── Mirror GHL state into MongoDB update object ───────
-      update.ghl_product_full        = fullResult.productId;
-      update.ghl_price_full          = fullResult.priceId;
-      update.ghl_product_deposit     = depositResult.productId;
-      update.ghl_price_deposit       = depositResult.priceId;
-      update.ghl_product_remainder   = remainderResult.productId;
-      update.ghl_price_remainder     = remainderResult.priceId;
-      update.ghl_product_installment = installmentResult.productId;
-      update.ghl_price_installment   = installmentResult.priceId;
+      // ── Monthly installment product ───────────────────────
+      if (monthlyPayments && installment > 0) {
+        if (!update.ghl_product_installment) {
+          const { productId, priceId } = await createGHLProductWithPrice(
+            `${teamLabel} – Monthly Installment ($${installment}/mo × ${months})`,
+            installment,
+            { interval: 'month', intervalCount: 1 }
+          );
+          update.ghl_product_installment = productId;
+          update.ghl_price_installment   = priceId;
+        }
+      } else {
+        if (existing?.ghl_product_installment && !feeChanged) {
+          await deleteGHLProduct(existing.ghl_product_installment);
+        }
+        update.ghl_product_installment = '';
+        update.ghl_price_installment   = '';
+      }
 
     } catch (ghlErr) {
       // GHL errors are non-fatal — always fall through to the DB save
@@ -1323,10 +1309,51 @@ app.post('/api/checkout', async (req, res) => {
 
     const stripeProduct = productSearch.data[0];
 
+    // ── TEMPORARY DEBUG LOG ───────────────────────────────────
+    const allPricesDebug = await stripe.prices.list({ product: stripeProduct.id, limit: 10 });
+    console.log(`🔍 DEBUG — Product: "${productName}" | Stripe productId: ${stripeProduct.id} | Total prices found: ${allPricesDebug.data.length}`);
+    allPricesDebug.data.forEach(p => {
+      console.log(`   price_id: ${p.id} | amount: $${p.unit_amount/100} | active: ${p.active} | created: ${new Date(p.created * 1000).toISOString()}`);
+    });
+    // ── END DEBUG ─────────────────────────────────────────────
+
+    // ── Map paymentType → amount in cents ────────────────────
+    const amountMap = {
+      full:        Math.round(fee         * 100),
+      deposit:     Math.round(deposit     * 100),
+      remainder:   Math.round(remainder   * 100),
+      installment: Math.round(installment * 100),
+    };
+    const amountCents = amountMap[paymentType] || 0;
+
     // ── Get the active price for this product ─────────────────
-    const prices = await stripe.prices.list({ product: stripeProduct.id, active: true, limit: 1 });
+    let prices = await stripe.prices.list({ product: stripeProduct.id, active: true, limit: 1 });
+
     if (!prices.data.length) {
-      return res.status(404).json({ message: `No active price found for Stripe product: "${productName}"` });
+      // No active price — check if any price exists (inactive)
+      const allPrices = await stripe.prices.list({ product: stripeProduct.id, limit: 10 });
+
+      if (allPrices.data.length) {
+        // Price exists but inactive — activate it
+        const toActivate = allPrices.data[0];
+        const activated  = await stripe.prices.update(toActivate.id, { active: true });
+        console.log(`✅  Auto-activated Stripe price: ${activated.id} for product: "${productName}"`);
+        prices = { data: [activated] };
+      } else {
+        // No price at all — GHL synced the product but not the price, create it directly in Stripe
+        console.log(`⚠️  No price found in Stripe for "${productName}" — creating directly in Stripe`);
+        const isInstallment = paymentType === 'installment';
+        const newPrice = await stripe.prices.create({
+          product:     stripeProduct.id,
+          unit_amount: amountCents,
+          currency:    'usd',
+          ...(isInstallment ? {
+            recurring: { interval: 'month', interval_count: 1 },
+          } : {}),
+        });
+        console.log(`✅  Stripe price created directly: ${newPrice.id} for product: "${productName}"`);
+        prices = { data: [newPrice] };
+      }
     }
 
     const priceId = prices.data[0].id;
@@ -1335,8 +1362,8 @@ app.post('/api/checkout', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: paymentType === 'installment' ? 'subscription' : 'payment',
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: successUrl || `${req.headers.origin || 'https://baseball-frontend-mu.vercel.app'}?payment=success`,
-      cancel_url:  cancelUrl  || `${req.headers.origin || 'https://baseball-frontend-mu.vercel.app'}?payment=cancelled`,
+      success_url: successUrl || `${req.headers.origin || 'https://yoursite.com'}?payment=success`,
+      cancel_url:  cancelUrl  || `${req.headers.origin || 'https://yoursite.com'}?payment=cancelled`,
       metadata: {
         playerPaymentId,
         paymentType,
@@ -1608,6 +1635,18 @@ app.put('/api/admin/coaches/:id/edit', requireAdmin, async (req, res) => {
   }
 });
 
+// GET /api/admin/coaches/:id/token — generate a coach JWT so admin can act as that coach
+app.get('/api/admin/coaches/:id/token', requireAdmin, async (req, res) => {
+  try {
+    const coach = await Coach.findById(req.params.id).select('_id');
+    if (!coach) return res.status(404).json({ message: 'Coach not found' });
+    const token = signToken(coach._id);
+    res.json({ token, coachId: coach._id });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════
 //  PUBLIC ROUTES
 // ════════════════════════════════════════════════════════════════
@@ -1632,7 +1671,7 @@ app.get('/api/teams', async (req, res) => {
 app.get('/api/teams/:id', async (req, res) => {
   try {
     const team = await Coach.findById(req.params.id)
-      .select('first_name last_name email_public phone_public bio image_url team_name state location age_group team_details assistant1 assistant2');
+      .select('first_name last_name email_public phone_public bio image_url team_name state location age_group team_details register_enabled assistant1 assistant2');
     if (!team) return res.status(404).json({ message: 'Team not found' });
     res.json({ team: normalizeCoach(team) });
   } catch (err) {
@@ -1660,21 +1699,50 @@ app.get('/api/teams/:id/roster', async (req, res) => {
 
 app.post('/api/teams/:id/roster', async (req, res) => {
   try {
-    const { name, jersey, gradYear, position, hw, city, state, email, cell } = req.body;
+    const {
+      name, jersey, jersey2, gradYear, position, pos2, hw, city, state,
+      address, zip, email, cell, dob, bats, throws, highSchool,
+      motherFirst, motherLast, motherCell, motherEmail,
+      fatherFirst, fatherLast, fatherCell, fatherEmail,
+      teamName,
+    } = req.body;
     if (!name) return res.status(400).json({ message: 'Player name is required' });
     const player = await Player.create({
-      coach_id:  req.params.id,
+      coach_id:     req.params.id,
       name,
-      jersey,
-      grad_year: gradYear,
-      position,
-      hw,
-      city,
-      state,
-      email:     email || '',
-      cell:      cell  || '',
+      jersey:       jersey      || '',
+      jersey_2:     jersey2     || '',
+      grad_year:    gradYear    || '',
+      position:     position    || '',
+      pos2:         pos2        || '',
+      hw:           hw          || '',
+      city:         city        || '',
+      state:        state       || '',
+      address:      address     || '',
+      zip:          zip         || '',
+      email:        email       || '',
+      cell:         cell        || '',
+      dob:          dob         || '',
+      bats:         bats        || '',
+      throws:       throws      || '',
+      high_school:  highSchool  || '',
+      mother_first: motherFirst || '',
+      mother_last:  motherLast  || '',
+      mother_cell:  motherCell  || '',
+      mother_email: motherEmail || '',
+      father_first: fatherFirst || '',
+      father_last:  fatherLast  || '',
+      father_cell:  fatherCell  || '',
+      father_email: fatherEmail || '',
     });
-    upsertGHLPlayer({ name, email, cell, city, state, position, jersey, gradYear, hw });
+    await upsertGHLPlayer({
+      name, email, cell, dob, bats, throws, hw,
+      jersey, jersey2, gradYear, position, pos2,
+      address, city, state, zip, highSchool,
+      motherFirst, motherLast, motherCell, motherEmail,
+      fatherFirst, fatherLast, fatherCell, fatherEmail,
+      teamName,
+    });
     res.status(201).json({ message: 'Player registered', player: normalizePlayer(player) });
   } catch (err) {
     res.status(500).json({ message: err.message || 'Server error' });
@@ -1683,11 +1751,42 @@ app.post('/api/teams/:id/roster', async (req, res) => {
 
 app.put('/api/teams/:id/roster/:playerId', requireAuth, async (req, res) => {
   try {
-    const { name, jersey, gradYear, position, hw, city, state, email, cell } = req.body;
+    const {
+      name, jersey, jersey2, gradYear, position, pos2, hw, city, state,
+      address, zip, email, cell, dob, bats, throws, highSchool,
+      motherFirst, motherLast, motherCell, motherEmail,
+      fatherFirst, fatherLast, fatherCell, fatherEmail,
+    } = req.body;
     if (!name) return res.status(400).json({ message: 'Player name is required' });
     const player = await Player.findOneAndUpdate(
       { _id: req.params.playerId, coach_id: req.params.id },
-      { name, jersey, grad_year: gradYear, position, hw, city, state, email, cell },
+      {
+        name,
+        jersey:       jersey      || '',
+        jersey_2:     jersey2     || '',
+        grad_year:    gradYear    || '',
+        position:     position    || '',
+        pos2:         pos2        || '',
+        hw:           hw          || '',
+        city:         city        || '',
+        state:        state       || '',
+        address:      address     || '',
+        zip:          zip         || '',
+        email:        email       || '',
+        cell:         cell        || '',
+        dob:          dob         || '',
+        bats:         bats        || '',
+        throws:       throws      || '',
+        high_school:  highSchool  || '',
+        mother_first: motherFirst || '',
+        mother_last:  motherLast  || '',
+        mother_cell:  motherCell  || '',
+        mother_email: motherEmail || '',
+        father_first: fatherFirst || '',
+        father_last:  fatherLast  || '',
+        father_cell:  fatherCell  || '',
+        father_email: fatherEmail || '',
+      },
       { new: true }
     );
     if (!player) return res.status(404).json({ message: 'Player not found' });
