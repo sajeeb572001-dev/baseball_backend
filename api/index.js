@@ -152,6 +152,28 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
     }
   }
 
+  // ── Subscription cancelled (user cancelled or Stripe auto-cancelled at deadline) ──
+  if (event.type === 'customer.subscription.deleted') {
+    const subscription = event.data.object;
+    const { playerPaymentId } = subscription.metadata || {};
+
+    if (playerPaymentId) {
+      try {
+        const existing = await PlayerPayment.findById(playerPaymentId);
+        if (existing && existing.status !== 'Paid') {
+          const balance = Math.max(0, (existing.total_fee || 0) - (existing.amount_paid || 0));
+          // Only mark Cancelled if there's still an outstanding balance.
+          // If balance is 0 the subscription ended naturally after all payments — leave as Paid.
+          const status = balance > 0 ? 'Cancelled' : 'Paid';
+          await PlayerPayment.findByIdAndUpdate(playerPaymentId, { status, balance });
+          console.log(`🚫  Subscription ${subscription.id} ended — playerPaymentId=${playerPaymentId} status=${status} balance=${balance}`);
+        }
+      } catch (err) {
+        console.error('❌  Failed to update PlayerPayment on subscription cancel:', err.message);
+      }
+    }
+  }
+
   res.json({ received: true });
 });
 
@@ -1093,7 +1115,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
     // ── Dollar amounts ────────────────────────────────────────
     const fee         = Number(playerFee)         || 0;
     const deposit     = Number(depositAmount)     || 250;
-    const months = Number(installmentMonths) || (monthlyPayments ? 3 : 0);
+    const months      = Number(installmentMonths) || 3;
     const remainder   = Math.max(0, fee - deposit);
     const installment = months > 0
       ? Math.round((fee / months) * 100) / 100
@@ -1440,6 +1462,17 @@ app.post('/api/checkout', async (req, res) => {
           : {}),
       },
     };
+
+    // For installments: store playerPaymentId on the subscription itself
+    // so the customer.subscription.deleted webhook can link back to the player
+    if (paymentType === 'installment') {
+      sessionParams.subscription_data = {
+        metadata: {
+          playerPaymentId,
+          coachId,
+        },
+      };
+    }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
 
