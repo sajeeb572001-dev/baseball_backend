@@ -1086,13 +1086,14 @@ app.get('/api/coach/financials', requireAuth, async (req, res) => {
 // POST /api/coach/financials
 // Creates or updates financial settings and syncs Stripe products/prices directly.
 //
-// Rules:
-//   • Deposit OFF  → only Full Payment product in Stripe
-//   • Deposit ON   → only Deposit + Remaining Balance products in Stripe (no Full Payment)
-//   • Monthly payments can exist alongside either of the above
-//   • Fee change   → archive all old Stripe products and recreate fresh
-//   • Toggle OFF   → archive that product, clear stored IDs
-//   • Stripe error → logs error but always saves to MongoDB
+// Product matrix:
+//   • Full pay only        → Full product only
+//   • Monthly only         → Installment product only
+//   • Deposit only         → Deposit + Remainder products
+//   • Deposit + Monthly    → Deposit + Installment products (no remainder — installments cover it)
+//   • Fee change           → archive all old Stripe products and recreate fresh
+//   • Toggle OFF           → archive that product, clear stored IDs
+//   • Stripe error         → logs error but always saves to MongoDB
 app.post('/api/coach/financials', requireAuth, async (req, res) => {
   try {
     const {
@@ -1170,8 +1171,8 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
         update.stripe_price_installment   = '';
       }
 
-      // ── Full pay product (ONLY when deposit is OFF) ───────
-      if (!depositEnabled) {
+      // ── Full pay product (ONLY when deposit is OFF AND monthly is OFF) ──
+      if (!depositEnabled && !monthlyPayments) {
         if (fee > 0 && !update.stripe_product_full) {
           const { productId, priceId } = await createStripeProductWithPrice(
             `${teamLabel} – Full Payment ($${fee})`,
@@ -1181,7 +1182,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
           update.stripe_price_full   = priceId;
         }
       } else {
-        // Deposit is ON — full pay product not needed; archive if it exists
+        // Deposit ON or monthly ON — full pay product not needed; archive if it exists
         if (existing?.stripe_product_full && !feeChanged) {
           await deleteStripeProduct(existing.stripe_product_full);
         }
@@ -1207,8 +1208,9 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
         update.stripe_price_deposit   = '';
       }
 
-      // ── Remainder product (balance after deposit, ONLY when deposit is ON) ──
-      if (depositEnabled && remainder > 0) {
+      // ── Remainder product (ONLY when deposit is ON AND monthly is OFF) ──
+      // When deposit + monthly: installments cover the remainder, no lump sum product needed
+      if (depositEnabled && !monthlyPayments && remainder > 0) {
         if (!update.stripe_product_remainder) {
           const { productId, priceId } = await createStripeProductWithPrice(
             `${teamLabel} – Remaining Balance ($${remainder})`,
@@ -1225,7 +1227,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
         update.stripe_price_remainder   = '';
       }
 
-      // ── Monthly installment product ───────────────────────
+      // ── Monthly installment product (ONLY when monthly is ON) ────────────
       // We create ONE Stripe product at setup time as a container.
       // Prices are created dynamically per-player at checkout (one price
       // per unique monthly amount, shared by all players registering in
@@ -1233,7 +1235,6 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       // via cancel_at so players are never overbilled.
       if (monthlyPayments) {
         if (!update.stripe_product_installment) {
-          // Create just the product — no price yet
           const product = await stripe.products.create({
             name: `${teamLabel} – Monthly Installment`,
             metadata: { coachId: String(req.coachId), teamLabel },
