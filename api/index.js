@@ -152,6 +152,61 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
     }
   }
 
+  // ── Monthly installment payment succeeded (every charge AFTER the first) ──
+  // checkout.session.completed already handles the very first payment (billing_reason = 'subscription_create').
+  // invoice.payment_succeeded fires for all subsequent monthly renewals, so we skip the first one here.
+  if (event.type === 'invoice.payment_succeeded') {
+    const invoice = event.data.object;
+
+    // Skip the first charge — checkout.session.completed already recorded it
+    if (invoice.billing_reason === 'subscription_create') {
+      console.log(`⏭️  invoice.payment_succeeded skipped (subscription_create — already handled by checkout.session.completed)`);
+    } else {
+      // Pull playerPaymentId from the subscription's metadata
+      const subId = invoice.subscription;
+      if (subId && stripe) {
+        try {
+          const subscription     = await stripe.subscriptions.retrieve(subId);
+          const { playerPaymentId } = subscription.metadata || {};
+          const amountPaid       = invoice.amount_paid / 100; // cents → dollars
+
+          if (playerPaymentId && amountPaid > 0) {
+            const existing = await PlayerPayment.findById(playerPaymentId);
+            if (existing) {
+              const newAmountPaid = Math.min(
+                (existing.amount_paid || 0) + amountPaid,
+                existing.total_fee || 0           // never exceed total_fee
+              );
+              const newBalance = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
+              const newStatus  = newBalance <= 0 ? 'Paid' : 'Partial';
+
+              await PlayerPayment.findByIdAndUpdate(playerPaymentId, {
+                amount_paid: newAmountPaid,
+                balance:     newBalance,
+                status:      newStatus,
+              });
+              console.log(`✅  Installment recorded — playerPaymentId=${playerPaymentId} +$${amountPaid} paid=$${newAmountPaid} balance=$${newBalance} status=${newStatus}`);
+
+              // ── Auto-cancel subscription once fully paid ──────────
+              // If the player has paid in full before the deadline, cancel
+              // the Stripe subscription immediately so they are never charged again.
+              if (newBalance <= 0) {
+                try {
+                  await stripe.subscriptions.cancel(subId);
+                  console.log(`🎉  Subscription ${subId} cancelled — fully paid (balance=0)`);
+                } catch (cancelErr) {
+                  console.error(`⚠️  Could not cancel subscription ${subId}:`, cancelErr.message);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          console.error('❌  Failed to process invoice.payment_succeeded:', err.message);
+        }
+      }
+    }
+  }
+
   // ── Subscription cancelled (user cancelled or Stripe auto-cancelled at deadline) ──
   if (event.type === 'customer.subscription.deleted') {
     const subscription = event.data.object;
