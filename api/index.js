@@ -104,8 +104,11 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         const deadline = session.metadata?.paymentDeadline || '';
         if (deadline) {
           const cancelAt = Math.floor(new Date(deadline) / 1000);
-          await stripe.subscriptions.update(session.subscription, { cancel_at: cancelAt });
-          console.log(`📅  Subscription ${session.subscription} set to cancel_at ${deadline}`);
+          await stripe.subscriptions.update(session.subscription, {
+            cancel_at:        cancelAt,
+            proration_behavior: 'none', // never prorate — always charge full monthly amount
+          });
+          console.log(`📅  Subscription ${session.subscription} set to cancel_at ${deadline} (proration disabled)`);
         }
       } catch (subErr) {
         console.error('⚠️  Failed to set cancel_at on subscription:', subErr.message);
@@ -213,19 +216,31 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
             } else {
               console.log(`📊  Current record — total_fee=${existing.total_fee} amount_paid=${existing.amount_paid} balance=${existing.balance} status=${existing.status}`);
 
-              const newAmountPaid = Math.min(
-                (existing.amount_paid || 0) + amountPaid,
-                existing.total_fee || 0
-              );
-              const newBalance = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
+              const totalFee    = existing.total_fee || 0;
+              const paidSoFar  = existing.amount_paid || 0;
+              const remaining  = Math.max(0, totalFee - paidSoFar);
+
+              // ── Rounding fix ──────────────────────────────────────────────
+              // e.g. $1000 ÷ 6 = $166.67 × 6 = $1000.02 (2 cents over).
+              // If this payment is within $1 of clearing the balance, treat it
+              // as the final payment and zero out the balance exactly — never
+              // leave the player with a phantom $0.02 remaining.
+              const isLastPayment = Math.abs(amountPaid - remaining) <= 1.00;
+
+              const newAmountPaid = isLastPayment
+                ? totalFee                                        // zero out exactly
+                : Math.min(paidSoFar + amountPaid, totalFee);
+
+              const newBalance = Math.max(0, totalFee - newAmountPaid);
               const newStatus  = newBalance <= 0 ? 'Paid' : 'Partial';
 
-              console.log(`💾  Updating — newAmountPaid=${newAmountPaid} newBalance=${newBalance} newStatus=${newStatus}`);
+              console.log(`💾  Updating — isLastPayment=${isLastPayment} newAmountPaid=${newAmountPaid} newBalance=${newBalance} newStatus=${newStatus}`);
 
               await PlayerPayment.findByIdAndUpdate(playerPaymentId, {
-                amount_paid: newAmountPaid,
-                balance:     newBalance,
-                status:      newStatus,
+                amount_paid:       newAmountPaid,
+                balance:           newBalance,
+                status:            newStatus,
+                installments_paid: installmentsPaid,
               });
               console.log(`✅  DB updated successfully — playerPaymentId=${playerPaymentId}`);
 
@@ -1526,6 +1541,9 @@ app.post('/api/checkout', async (req, res) => {
       mode      = 'subscription';
       lineItems = [{ price: installmentPrice.id, quantity: 1 }];
 
+      // Store totalMonths so the webhook knows when the final payment is due
+      req._installmentTotalMonths = months;
+
       // Store cancel_at for use in session creation below
       req._installmentCancelAt = cancelAtTimestamp;
 
@@ -1583,9 +1601,11 @@ app.post('/api/checkout', async (req, res) => {
     // so the customer.subscription.deleted webhook can link back to the player
     if (paymentType === 'installment') {
       sessionParams.subscription_data = {
+        proration_behavior: 'none', // never charge partial months
         metadata: {
           playerPaymentId,
           coachId,
+          totalMonths: String(req._installmentTotalMonths || 0),
         },
       };
     }
