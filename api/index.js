@@ -93,8 +93,24 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const { playerPaymentId, paymentType } = session.metadata || {};
+    const { playerPaymentId, paymentType, coachId } = session.metadata || {};
     const amountPaid = session.amount_total / 100; // cents → dollars
+
+    // ── Set cancel_at on installment subscriptions ────────────
+    // We can't set cancel_at at checkout creation time (Stripe doesn't
+    // support it there), so we do it here once the subscription ID is known.
+    if (paymentType === 'installment' && session.subscription && stripe) {
+      try {
+        const deadline = session.metadata?.paymentDeadline || '';
+        if (deadline) {
+          const cancelAt = Math.floor(new Date(deadline) / 1000);
+          await stripe.subscriptions.update(session.subscription, { cancel_at: cancelAt });
+          console.log(`📅  Subscription ${session.subscription} set to cancel_at ${deadline}`);
+        }
+      } catch (subErr) {
+        console.error('⚠️  Failed to set cancel_at on subscription:', subErr.message);
+      }
+    }
 
     if (playerPaymentId) {
       try {
@@ -1418,20 +1434,12 @@ app.post('/api/checkout', async (req, res) => {
         playerPaymentId,
         paymentType,
         coachId,
+        // Include deadline in session metadata so the webhook can set cancel_at
+        ...(paymentType === 'installment' && financials.payment_deadline
+          ? { paymentDeadline: financials.payment_deadline }
+          : {}),
       },
     };
-
-    // For installments: auto-cancel the subscription at the payment deadline
-    if (paymentType === 'installment' && req._installmentCancelAt) {
-      sessionParams.subscription_data = {
-        cancel_at: req._installmentCancelAt,
-        metadata: {
-          playerPaymentId,
-          paymentType,
-          coachId,
-        },
-      };
-    }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
 
