@@ -1267,9 +1267,10 @@ app.get('/api/coach/financials', requireAuth, async (req, res) => {
 // Creates or updates financial settings and syncs Stripe products/prices directly.
 //
 // Rules:
-//   • Deposit OFF  → only Full Payment product in Stripe
-//   • Deposit ON   → only Deposit + Remaining Balance products in Stripe (no Full Payment)
-//   • Monthly payments can exist alongside either of the above
+//   • Deposit OFF, Monthly OFF  → Full Payment product only
+//   • Deposit ON,  Monthly OFF  → Deposit + Remaining Balance products (no Full Payment)
+//   • Deposit OFF, Monthly ON   → Monthly Installment product only (no Full, no Remainder)
+//   • Deposit ON,  Monthly ON   → Deposit + Monthly Installment products only (NO Remainder — balance collected via installments)
 //   • Fee change   → archive all old Stripe products and recreate fresh
 //   • Toggle OFF   → archive that product, clear stored IDs
 //   • Stripe error → logs error but always saves to MongoDB
@@ -1387,8 +1388,10 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
         update.stripe_price_deposit   = '';
       }
 
-      // ── Remainder product (balance after deposit, ONLY when deposit is ON) ──
-      if (depositEnabled && remainder > 0) {
+      // ── Remainder product (balance after deposit, ONLY when deposit is ON and monthly is OFF) ──
+      // When monthly payments are also enabled, the remaining balance is collected via
+      // installment subscriptions — no separate "Remaining Balance" product is needed.
+      if (depositEnabled && remainder > 0 && !monthlyPayments) {
         if (!update.stripe_product_remainder) {
           const { productId, priceId } = await createStripeProductWithPrice(
             `${teamLabel} – Remaining Balance ($${remainder})`,
