@@ -1093,7 +1093,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
     // ── Dollar amounts ────────────────────────────────────────
     const fee         = Number(playerFee)         || 0;
     const deposit     = Number(depositAmount)     || 250;
-    const months      = Number(installmentMonths) || 3;
+    const months = Number(installmentMonths) || (monthlyPayments ? 3 : 0);
     const remainder   = Math.max(0, fee - deposit);
     const installment = months > 0
       ? Math.round((fee / months) * 100) / 100
