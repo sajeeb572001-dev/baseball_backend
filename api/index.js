@@ -2034,6 +2034,32 @@ app.get('/api/teams/:id/tryouts', async (req, res) => {
 
 app.get('/api/teams/:id/roster', async (req, res) => {
   try {
+    // ── ?paid=true — public team page: only show players with a completed checkout ──
+    // Coach dashboard calls this endpoint WITHOUT ?paid=true so it always sees everyone.
+    if (req.query.paid === 'true') {
+      // Only filter if the team actually has a fee configured.
+      // If no financials exist (no payment required) show all registered players.
+      const financials = await TeamFinancials.findOne({ coach_id: req.params.id });
+
+      if (financials && (financials.player_fee || 0) > 0) {
+        // Find payment records where at least one successful payment was received
+        const paidRecords = await PlayerPayment.find({
+          coach_id:    req.params.id,
+          amount_paid: { $gt: 0 },
+        }).select('player_id');
+
+        const paidIds = paidRecords.map(r => r.player_id).filter(Boolean);
+
+        const players = await Player.find({
+          coach_id: req.params.id,
+          _id:      { $in: paidIds },
+        }).sort({ created_at: 1 });
+
+        return res.json({ players: players.map(normalizePlayer) });
+      }
+      // No financials / no fee set → fall through and return all players
+    }
+
     const players = await Player.find({ coach_id: req.params.id }).sort({ created_at: 1 });
     res.json({ players: players.map(normalizePlayer) });
   } catch (err) {
