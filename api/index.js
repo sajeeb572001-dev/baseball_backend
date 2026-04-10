@@ -94,53 +94,29 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const { playerPaymentId, paymentType, coachId } = session.metadata || {};
+    const amountPaid = session.amount_total / 100; // cents → dollars
 
-    // ── Create subscription schedule for installments ─────────
+    // ── Set cancel_at on installment subscriptions ────────────
+    // We can't set cancel_at at checkout creation time (Stripe doesn't
+    // support it there), so we do it here once the subscription ID is known.
     if (paymentType === 'installment' && session.subscription && stripe) {
       try {
-        const totalInstallments = parseInt(session.metadata?.installmentMonths || '0', 10);
-        const perMonthCents     = parseInt(session.metadata?.perMonthCents     || '0', 10);
-
-        if (totalInstallments > 0) {
-          // Create schedule from the existing subscription
-          const schedule = await stripe.subscriptionSchedules.create({
-            from_subscription: session.subscription,
-          });
-
-          // Set exact iterations — Stripe auto-cancels after last phase
-          await stripe.subscriptionSchedules.update(schedule.id, {
-            end_behavior: 'cancel',
-            phases: [{
-              items:      schedule.phases[0].items.map(item => ({
-                price:    item.price,
-                quantity: item.quantity,
-              })),
-              start_date: schedule.phases[0].start_date,
-              iterations: totalInstallments,
-            }],
-          });
-
-          console.log(`📅  Subscription schedule ${schedule.id} — ${totalInstallments} iterations, end_behavior: cancel`);
-
-          // Store per_month_amount on the PlayerPayment record for dashboard display
-          if (playerPaymentId && perMonthCents > 0) {
-            await PlayerPayment.findByIdAndUpdate(playerPaymentId, {
-              per_month_amount: perMonthCents / 100,
-            });
-          }
+        const deadline = session.metadata?.paymentDeadline || '';
+        if (deadline) {
+          const cancelAt = Math.floor(new Date(deadline) / 1000);
+          await stripe.subscriptions.update(session.subscription, { cancel_at: cancelAt });
+          console.log(`📅  Subscription ${session.subscription} set to cancel_at ${deadline}`);
         }
-      } catch (scheduleErr) {
-        console.error('⚠️  Failed to create subscription schedule:', scheduleErr.message);
+      } catch (subErr) {
+        console.error('⚠️  Failed to set cancel_at on subscription:', subErr.message);
       }
     }
 
-    // ── Update MongoDB for non-installment payments ───────────
-    if (playerPaymentId && paymentType !== 'installment') {
+    if (playerPaymentId) {
       try {
-        const amountPaid = (session.amount_total || 0) / 100;
-        const existing   = await PlayerPayment.findById(playerPaymentId);
+        const existing = await PlayerPayment.findById(playerPaymentId);
         if (existing) {
-          const today  = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+          const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
           const update = {};
 
           if (paymentType === 'deposit') {
@@ -155,18 +131,28 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
             update.amount_paid = existing.total_fee;
             update.balance     = 0;
             update.status      = 'Paid';
+            if (paymentType === 'deposit') {
+              update.deposit_paid      = true;
+              update.deposit_paid_date = today;
+            }
+          } else if (paymentType === 'installment') {
+            const newAmountPaid = (existing.amount_paid || 0) + amountPaid;
+            const newBalance    = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
+            update.amount_paid = newAmountPaid;
+            update.balance     = newBalance;
+            update.status      = newBalance <= 0 ? 'Paid' : 'Partial';
           }
 
           await PlayerPayment.findByIdAndUpdate(playerPaymentId, update);
-          console.log(`✅  Payment recorded — playerPaymentId=${playerPaymentId} type=${paymentType} amount=$${amountPaid}`);
+          console.log(`✅  Stripe payment recorded — playerPaymentId=${playerPaymentId} type=${paymentType}`);
         }
       } catch (dbErr) {
-        console.error('❌  Failed to update PlayerPayment after checkout:', dbErr.message);
+        console.error('❌  Failed to update PlayerPayment after Stripe webhook:', dbErr.message);
       }
     }
   }
 
-  // ── Subscription cancelled (user cancelled or safety-net cancel_at fired) ──
+  // ── Subscription cancelled (user cancelled or Stripe auto-cancelled at deadline) ──
   if (event.type === 'customer.subscription.deleted') {
     const subscription = event.data.object;
     const { playerPaymentId } = subscription.metadata || {};
@@ -176,54 +162,15 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         const existing = await PlayerPayment.findById(playerPaymentId);
         if (existing && existing.status !== 'Paid') {
           const balance = Math.max(0, (existing.total_fee || 0) - (existing.amount_paid || 0));
-          const status  = balance > 0 ? 'Cancelled' : 'Paid';
+          // Only mark Cancelled if there's still an outstanding balance.
+          // If balance is 0 the subscription ended naturally after all payments — leave as Paid.
+          const status = balance > 0 ? 'Cancelled' : 'Paid';
           await PlayerPayment.findByIdAndUpdate(playerPaymentId, { status, balance });
           console.log(`🚫  Subscription ${subscription.id} ended — playerPaymentId=${playerPaymentId} status=${status} balance=${balance}`);
         }
       } catch (err) {
         console.error('❌  Failed to update PlayerPayment on subscription cancel:', err.message);
       }
-    }
-  }
-
-  // ── Monthly installment payment received ──────────────────────────────────
-  // Fires every month when Stripe charges the player on the 1st.
-  // Updates MongoDB — the subscription schedule auto-cancels after N iterations.
-  if (event.type === 'invoice.payment_succeeded') {
-    const invoice = event.data.object;
-
-    // Only handle subscription invoices (not one-off)
-    if (!invoice.subscription) return res.json({ received: true });
-
-    try {
-      const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
-      const { playerPaymentId, totalInstallments } = subscription.metadata || {};
-
-      if (!playerPaymentId) return res.json({ received: true });
-
-      const amountPaid    = invoice.amount_paid / 100;
-      const totalExpected = parseInt(totalInstallments || '0', 10);
-
-      const existing = await PlayerPayment.findById(playerPaymentId);
-      if (!existing) return res.json({ received: true });
-
-      const newInstallmentsPaid = (existing.installments_paid || 0) + 1;
-      const newAmountPaid       = Math.round(((existing.amount_paid || 0) + amountPaid) * 100) / 100;
-      const newBalance          = Math.max(0, Math.round(((existing.total_fee || 0) - newAmountPaid) * 100) / 100);
-      const allPaid             = totalExpected > 0 && newInstallmentsPaid >= totalExpected;
-
-      await PlayerPayment.findByIdAndUpdate(playerPaymentId, {
-        installments_paid: newInstallmentsPaid,
-        amount_paid:       newAmountPaid,
-        balance:           newBalance,
-        status:            allPaid ? 'Paid' : 'Partial',
-      });
-
-      console.log(`💳  Installment ${newInstallmentsPaid}/${totalExpected} paid — playerPaymentId=${playerPaymentId} amount=$${amountPaid} balance=$${newBalance}${allPaid ? ' ✅ FULLY PAID' : ''}`);
-      // Note: subscription cancellation is handled natively by the Stripe
-      // subscription schedule (end_behavior: 'cancel', iterations: N)
-    } catch (err) {
-      console.error('❌  Failed to handle invoice.payment_succeeded:', err.message);
     }
   }
 
@@ -364,22 +311,19 @@ const teamFinancialsSchema = new mongoose.Schema({
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 
 const playerPaymentSchema = new mongoose.Schema({
-  coach_id:           { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
-  player_id:          { type: mongoose.Schema.Types.ObjectId, ref: 'Player', default: null },
-  player_name:        { type: String, default: '' },
-  total_fee:          { type: Number, default: 0 },
-  deposit_amount:     { type: Number, default: 0 },
-  deposit_paid:       { type: Boolean, default: false },
-  deposit_paid_date:  { type: String, default: '' },
-  payment_plan:       { type: mongoose.Schema.Types.Mixed, default: [] },
-  amount_paid:        { type: Number, default: 0 },
-  balance:            { type: Number, default: 0 },
-  status:             { type: String, default: 'Pending' },
-  registered_date:    { type: String, default: '' },
-  payment_deadline:   { type: String, default: '' },
-  total_installments: { type: Number, default: 0 }, // total number of monthly payments expected
-  installments_paid:  { type: Number, default: 0 }, // how many have been collected so far
-  per_month_amount:   { type: Number, default: 0 }, // per-month charge amount (set at checkout)
+  coach_id:          { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
+  player_id:         { type: mongoose.Schema.Types.ObjectId, ref: 'Player', default: null },
+  player_name:       { type: String, default: '' },
+  total_fee:         { type: Number, default: 0 },
+  deposit_amount:    { type: Number, default: 0 },
+  deposit_paid:      { type: Boolean, default: false },
+  deposit_paid_date: { type: String, default: '' },
+  payment_plan:      { type: mongoose.Schema.Types.Mixed, default: [] },
+  amount_paid:       { type: Number, default: 0 },
+  balance:           { type: Number, default: 0 },
+  status:            { type: String, default: 'Pending' },
+  registered_date:   { type: String, default: '' },
+  payment_deadline:  { type: String, default: '' },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 playerPaymentSchema.index({ coach_id: 1 });
 
@@ -1142,14 +1086,13 @@ app.get('/api/coach/financials', requireAuth, async (req, res) => {
 // POST /api/coach/financials
 // Creates or updates financial settings and syncs Stripe products/prices directly.
 //
-// Product matrix:
-//   • Full pay only        → Full product only
-//   • Monthly only         → Installment product only
-//   • Deposit only         → Deposit + Remainder products
-//   • Deposit + Monthly    → Deposit + Installment products (no remainder — installments cover it)
-//   • Fee change           → archive all old Stripe products and recreate fresh
-//   • Toggle OFF           → archive that product, clear stored IDs
-//   • Stripe error         → logs error but always saves to MongoDB
+// Rules:
+//   • Deposit OFF  → only Full Payment product in Stripe
+//   • Deposit ON   → only Deposit + Remaining Balance products in Stripe (no Full Payment)
+//   • Monthly payments can exist alongside either of the above
+//   • Fee change   → archive all old Stripe products and recreate fresh
+//   • Toggle OFF   → archive that product, clear stored IDs
+//   • Stripe error → logs error but always saves to MongoDB
 app.post('/api/coach/financials', requireAuth, async (req, res) => {
   try {
     const {
@@ -1227,8 +1170,8 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
         update.stripe_price_installment   = '';
       }
 
-      // ── Full pay product (ONLY when deposit is OFF AND monthly is OFF) ──
-      if (!depositEnabled && !monthlyPayments) {
+      // ── Full pay product (ONLY when deposit is OFF) ───────
+      if (!depositEnabled) {
         if (fee > 0 && !update.stripe_product_full) {
           const { productId, priceId } = await createStripeProductWithPrice(
             `${teamLabel} – Full Payment ($${fee})`,
@@ -1238,7 +1181,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
           update.stripe_price_full   = priceId;
         }
       } else {
-        // Deposit ON or monthly ON — full pay product not needed; archive if it exists
+        // Deposit is ON — full pay product not needed; archive if it exists
         if (existing?.stripe_product_full && !feeChanged) {
           await deleteStripeProduct(existing.stripe_product_full);
         }
@@ -1264,9 +1207,8 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
         update.stripe_price_deposit   = '';
       }
 
-      // ── Remainder product (ONLY when deposit is ON AND monthly is OFF) ──
-      // When deposit + monthly: installments cover the remainder, no lump sum product needed
-      if (depositEnabled && !monthlyPayments && remainder > 0) {
+      // ── Remainder product (balance after deposit, ONLY when deposit is ON) ──
+      if (depositEnabled && remainder > 0) {
         if (!update.stripe_product_remainder) {
           const { productId, priceId } = await createStripeProductWithPrice(
             `${teamLabel} – Remaining Balance ($${remainder})`,
@@ -1283,7 +1225,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
         update.stripe_price_remainder   = '';
       }
 
-      // ── Monthly installment product (ONLY when monthly is ON) ────────────
+      // ── Monthly installment product ───────────────────────
       // We create ONE Stripe product at setup time as a container.
       // Prices are created dynamically per-player at checkout (one price
       // per unique monthly amount, shared by all players registering in
@@ -1291,6 +1233,7 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       // via cancel_at so players are never overbilled.
       if (monthlyPayments) {
         if (!update.stripe_product_installment) {
+          // Create just the product — no price yet
           const product = await stripe.products.create({
             name: `${teamLabel} – Monthly Installment`,
             metadata: { coachId: String(req.coachId), teamLabel },
@@ -1333,37 +1276,25 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
 // paymentType: 'full' | 'deposit' | 'remainder' | 'installment'
 
 /**
- * Returns the number of monthly installments from the first payment date
- * (registration + 7 days) up to and including the deadline month.
- *
- * e.g. registers June 10 → first payment June 17 → deadline September
- *      → 4 months (Jun, Jul, Aug, Sep) → 4 iterations of $500
- *
- * e.g. registers June 25 → first payment July 2 → deadline September
- *      → 3 months (Jul, Aug, Sep) → 3 iterations of $666.67
- *
- * @param {string} deadlineStr  - deadline date string (e.g. "September 10, 2026")
- * @param {Date}   [now]        - override "today" — used for test clock simulations
+ * Returns the number of whole calendar months from today up to and including
+ * the deadline month.  e.g. today = June, deadline = September → 4 (Jun/Jul/Aug/Sep).
+ * Always returns at least 1.
  */
-function monthsRemainingUntilDeadline(deadlineStr, now = new Date()) {
+function monthsRemainingUntilDeadline(deadlineStr) {
   if (!deadlineStr) return 1;
+  const now      = new Date();
   const deadline = new Date(deadlineStr);
   if (isNaN(deadline)) return 1;
 
-  // First payment fires 7 days after registration
-  const firstPaymentDate  = new Date(now);
-  firstPaymentDate.setDate(firstPaymentDate.getDate() + 7);
-
-  const firstPaymentMonth = firstPaymentDate.getFullYear() * 12 + firstPaymentDate.getMonth();
-  const deadlineMonth     = deadline.getFullYear()         * 12 + deadline.getMonth();
-
-  return Math.max(1, deadlineMonth - firstPaymentMonth + 1);
+  // Compare year+month only — we want full calendar months inclusive of today's month
+  const nowMonth      = now.getFullYear() * 12      + now.getMonth();
+  const deadlineMonth = deadline.getFullYear() * 12 + deadline.getMonth();
+  return Math.max(1, deadlineMonth - nowMonth + 1);
 }
 
 // GET /api/teams/:id/installment-preview
 // Public — returns the dynamic per-month amount for a player registering today.
 // Used by team.html to show the correct payment plan before checkout.
-// Optional query param: ?date=2026-06-01  (for test clock simulation)
 app.get('/api/teams/:id/installment-preview', async (req, res) => {
   try {
     const financials = await TeamFinancials.findOne({ coach_id: req.params.id });
@@ -1371,15 +1302,11 @@ app.get('/api/teams/:id/installment-preview', async (req, res) => {
       return res.json({ enabled: false });
     }
 
-    // Allow a custom "registration date" for test clock simulations
-    const now = req.query.date ? new Date(req.query.date) : new Date();
-    if (isNaN(now)) return res.status(400).json({ message: 'Invalid date query param' });
-
     const fee        = financials.player_fee     || 0;
     const deposit    = financials.deposit_amount || 0;
     const depEnabled = financials.deposit_enabled || false;
     const balance    = depEnabled ? Math.max(0, fee - deposit) : fee;
-    const months     = monthsRemainingUntilDeadline(financials.payment_deadline, now);
+    const months     = monthsRemainingUntilDeadline(financials.payment_deadline);
     const perMonth   = months > 0 ? Math.round((balance / months) * 100) / 100 : balance;
 
     res.json({
@@ -1391,7 +1318,6 @@ app.get('/api/teams/:id/installment-preview', async (req, res) => {
       depositEnabled:  depEnabled,
       depositAmount:   deposit,
       paymentDeadline: financials.payment_deadline || '',
-      simulatedDate:   req.query.date || null,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -1402,20 +1328,9 @@ app.post('/api/checkout', async (req, res) => {
   if (!stripe) return res.status(500).json({ message: 'Stripe is not configured on the server' });
 
   try {
-    const {
-      coachId, paymentType, playerPaymentId, successUrl, cancelUrl,
-      registrationDate,    // optional — ISO date string for test clock simulation
-      testClockCustomerId, // optional — Stripe customer ID attached to a test clock
-    } = req.body;
-
+    const { coachId, paymentType, playerPaymentId, successUrl, cancelUrl } = req.body;
     if (!coachId || !paymentType || !playerPaymentId) {
       return res.status(400).json({ message: 'coachId, paymentType, and playerPaymentId are required' });
-    }
-
-    // Use simulated date if provided (test clock), otherwise real now
-    const registrationNow = registrationDate ? new Date(registrationDate) : new Date();
-    if (isNaN(registrationNow)) {
-      return res.status(400).json({ message: 'Invalid registrationDate' });
     }
 
     // ── Get stored Stripe price IDs from financials ───────────
@@ -1428,8 +1343,6 @@ app.post('/api/checkout', async (req, res) => {
     // ── Build checkout session ────────────────────────────────
     let lineItems;
     let mode;
-    let months            = 0;
-    let perMonthCentsOuter = 0; // set inside installment block, used in session metadata
 
     if (paymentType === 'installment') {
       // ── DYNAMIC installment: calculate months remaining for this player ──
@@ -1448,23 +1361,24 @@ app.post('/api/checkout', async (req, res) => {
         return res.status(400).json({ message: 'No payment deadline set. Coach must set a deadline first.' });
       }
 
-      const fee        = financials.player_fee      || 0;
-      const deposit    = financials.deposit_amount  || 0;
-      const depEnabled = financials.deposit_enabled || false;
+      const fee          = financials.player_fee      || 0;
+      const deposit      = financials.deposit_amount  || 0;
+      const depEnabled   = financials.deposit_enabled || false;
 
+      // Balance to split = full fee, or fee minus deposit if deposit is enabled
       const balanceToSplit = depEnabled ? Math.max(0, fee - deposit) : fee;
       if (balanceToSplit <= 0) {
         return res.status(400).json({ message: 'No balance remaining to split into installments.' });
       }
 
-      // Use registrationNow (real or simulated) for month calculation
-      months              = monthsRemainingUntilDeadline(financials.payment_deadline, registrationNow);
+      const months        = monthsRemainingUntilDeadline(financials.payment_deadline);
       const perMonthCents = Math.round((balanceToSplit / months) * 100);
-      perMonthCentsOuter  = perMonthCents;
 
-      console.log(`📅  Installment checkout — date=${registrationNow.toISOString()} deadline=${financials.payment_deadline} months=${months} balance=$${balanceToSplit} per-month=$${(perMonthCents/100).toFixed(2)}${testClockCustomerId ? ' [TEST CLOCK]' : ''}`);
+      console.log(`📅  Installment checkout — deadline=${financials.payment_deadline} months=${months} balance=$${balanceToSplit} per-month=$${(perMonthCents/100).toFixed(2)}`);
 
       // ── Find existing price for this exact amount, or create one ──
+      // This means all players registering in the same month share the
+      // same price object — no duplicate prices in Stripe.
       const existingPrices = await stripe.prices.list({
         product: productId,
         active:  true,
@@ -1474,7 +1388,7 @@ app.post('/api/checkout', async (req, res) => {
       let installmentPrice = existingPrices.data.find(p => p.unit_amount === perMonthCents);
 
       if (installmentPrice) {
-        console.log(`♻️  Reusing existing Stripe price ${installmentPrice.id} ($${perMonthCents/100}/mo)`);
+        console.log(`♻️  Reusing existing Stripe price ${installmentPrice.id} ($${perMonthCents/100}/mo) for product ${productId}`);
       } else {
         installmentPrice = await stripe.prices.create({
           product:     productId,
@@ -1485,14 +1399,19 @@ app.post('/api/checkout', async (req, res) => {
             months:          String(months),
             paymentDeadline: financials.payment_deadline,
             balanceToSplit:  String(balanceToSplit),
-            registrationDate: registrationNow.toISOString(),
           },
         });
-        console.log(`💰  New Stripe price created ${installmentPrice.id} ($${perMonthCents/100}/mo × ${months} months)`);
+        console.log(`💰  New Stripe price created ${installmentPrice.id} ($${perMonthCents/100}/mo × ${months} months) for product ${productId}`);
       }
+
+      // ── cancel_at = deadline date (Stripe auto-cancels the subscription) ──
+      const cancelAtTimestamp = Math.floor(new Date(financials.payment_deadline) / 1000);
 
       mode      = 'subscription';
       lineItems = [{ price: installmentPrice.id, quantity: 1 }];
+
+      // Store cancel_at for use in session creation below
+      req._installmentCancelAt = cancelAtTimestamp;
 
     } else {
       // ── Static payment types: full | deposit | remainder ──────
@@ -1509,6 +1428,7 @@ app.post('/api/checkout', async (req, res) => {
         });
       }
 
+      // Verify the price is still active in Stripe
       let price;
       try {
         price = await stripe.prices.retrieve(priceId);
@@ -1536,31 +1456,20 @@ app.post('/api/checkout', async (req, res) => {
         playerPaymentId,
         paymentType,
         coachId,
-        ...(paymentType === 'installment' ? {
-          installmentMonths: String(months),
-          perMonthCents:     String(perMonthCentsOuter),
-        } : {}),
+        // Include deadline in session metadata so the webhook can set cancel_at
+        ...(paymentType === 'installment' && financials.payment_deadline
+          ? { paymentDeadline: financials.payment_deadline }
+          : {}),
       },
     };
 
-    // Attach test clock customer if provided
-    if (testClockCustomerId) {
-      sessionParams.customer = testClockCustomerId;
-      console.log(`🧪  Test clock customer attached: ${testClockCustomerId}`);
-    }
-
-    // For installments: use a 7-day trial so the first real charge fires
-    // exactly 7 days after registration. Then monthly from that date.
-    // The subscription schedule (created in checkout.session.completed webhook)
-    // sets exact iterations and auto-cancels after the last payment.
+    // For installments: store playerPaymentId on the subscription itself
+    // so the customer.subscription.deleted webhook can link back to the player
     if (paymentType === 'installment') {
       sessionParams.subscription_data = {
-        trial_period_days: 7,
         metadata: {
           playerPaymentId,
           coachId,
-          totalInstallments: String(months),
-          perMonthCents:     String(Math.round((financials.player_fee / months) * 100)),
         },
       };
     }
@@ -1590,24 +1499,21 @@ app.get('/api/coach/player-payments', requireAuth, async (req, res) => {
 app.post('/api/coach/player-payments', async (req, res) => {
   try {
     const { coachId, playerId, playerName, totalFee, depositAmount,
-            paymentPlan, balance, registeredDate, paymentDeadline,
-            totalInstallments } = req.body;
+            paymentPlan, balance, registeredDate, paymentDeadline } = req.body;
     if (!coachId) return res.status(400).json({ message: 'coachId is required' });
     const data = await PlayerPayment.create({
-      coach_id:           coachId,
-      player_id:          playerId           || null,
-      player_name:        playerName         || '',
-      total_fee:          totalFee           || 0,
-      deposit_amount:     depositAmount      || 0,
-      deposit_paid:       false,
-      payment_plan:       paymentPlan        || [],
-      amount_paid:        0,
-      balance:            balance            || totalFee || 0,
-      status:             'Pending',
-      registered_date:    registeredDate     || '',
-      payment_deadline:   paymentDeadline    || '',
-      total_installments: totalInstallments  || 0,
-      installments_paid:  0,
+      coach_id:         coachId,
+      player_id:        playerId        || null,
+      player_name:      playerName      || '',
+      total_fee:        totalFee        || 0,
+      deposit_amount:   depositAmount   || 0,
+      deposit_paid:     false,
+      payment_plan:     paymentPlan     || [],
+      amount_paid:      0,
+      balance:          balance         || totalFee || 0,
+      status:           'Pending',
+      registered_date:  registeredDate  || '',
+      payment_deadline: paymentDeadline || '',
     });
     res.status(201).json({ message: 'Payment record created', payment: data });
   } catch (err) {
