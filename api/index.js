@@ -175,12 +175,19 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
       console.log(`🔔  invoice.payment_succeeded — billing_reason=${invoice.billing_reason} amount=${invoice.amount_paid} sub=${invoice.subscription}`);
     }
 
+    // ── Extract subscription ID — location changed in Stripe API 2026-02-25 ──
+    // Old API: invoice.subscription
+    // New API: invoice.parent.subscription_details.subscription
+    const subId = invoice.subscription
+      || invoice?.parent?.subscription_details?.subscription
+      || invoice?.parent?.subscription
+      || null;
+
+    console.log(`🔍  Resolved subId=${subId} (from invoice.subscription=${invoice.subscription} parent=${JSON.stringify(invoice.parent || null)})`);
+
     if (invoice.billing_reason === 'subscription_create') {
       console.log(`⏭️  Skipping — first charge already handled by checkout.session.completed`);
     } else {
-      const subId = invoice.subscription;
-      console.log(`🔍  Looking up subscription: ${subId}`);
-
       if (!subId) {
         console.error('❌  No subscription ID on invoice — cannot process');
       } else if (!stripe) {
