@@ -247,16 +247,67 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
               });
               console.log(`✅  DB updated successfully — playerPaymentId=${playerPaymentId}`);
 
-              // ── Cancel subscription after last payment ────────────────────
-              // We cancel at period end (not immediately) so the current billing
-              // cycle completes cleanly without any proration charge.
+              // ── Handle second-to-last and last payment ────────────────
+              // The problem: if the last billing cycle is shorter than 30 days
+              // (e.g. registered July 10, deadline Sept 30 — last cycle is
+              // Sept 10 → Sept 30 = 20 days), Stripe prorates and charges less.
+              //
+              // Solution: after the SECOND-TO-LAST payment, cancel the subscription
+              // immediately and create a one-time invoice for the exact remaining
+              // balance. This guarantees the full amount is always collected
+              // regardless of how many days are left in the final cycle.
+              const isSecondToLast = totalMonths > 1 && installmentsPaid === totalMonths - 1;
+
               if (isLastPayment || newBalance <= 0) {
-                console.log(`🎉  All payments complete — cancelling subscription ${subId} at period end`);
+                // All done — cancel subscription cleanly
+                console.log(`🎉  All payments complete — cancelling subscription ${subId}`);
                 try {
-                  await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
-                  console.log(`✅  Subscription ${subId} set to cancel at period end — no further charges`);
+                  await stripe.subscriptions.cancel(subId);
+                  console.log(`✅  Subscription ${subId} cancelled — fully paid`);
                 } catch (cancelErr) {
                   console.error(`⚠️  Could not cancel subscription ${subId}:`, cancelErr.message);
+                }
+
+              } else if (isSecondToLast && stripe) {
+                // Second-to-last payment just completed.
+                // Cancel the subscription NOW and immediately invoice the exact
+                // remaining balance as a one-time charge — this avoids any
+                // proration on the final cycle.
+                console.log(`⏭️  Second-to-last payment done — cancelling subscription and invoicing remaining balance ${newBalance}`);
+                try {
+                  // 1. Get the customer ID from the subscription
+                  const sub        = await stripe.subscriptions.retrieve(subId);
+                  const customerId = sub.customer;
+
+                  // 2. Cancel the subscription immediately (no more auto-charges)
+                  await stripe.subscriptions.cancel(subId);
+                  console.log(`🚫  Subscription ${subId} cancelled after ${installmentsPaid} payments`);
+
+                  // 3. Create a one-time invoice for the exact remaining balance
+                  const remainingCents = Math.round(newBalance * 100);
+                  const invoiceItem = await stripe.invoiceItems.create({
+                    customer:    customerId,
+                    amount:      remainingCents,
+                    currency:    'usd',
+                    description: `Final installment — remaining balance`,
+                    metadata:    { playerPaymentId, subId },
+                  });
+
+                  const finalInvoice = await stripe.invoices.create({
+                    customer:          customerId,
+                    auto_advance:      true, // automatically charge the card on file
+                    collection_method: 'charge_automatically',
+                    metadata:          { playerPaymentId, paymentType: 'installment_final', coachId: subscription.metadata?.coachId || '' },
+                  });
+
+                  await stripe.invoices.finalizeInvoice(finalInvoice.id);
+                  await stripe.invoices.pay(finalInvoice.id);
+                  console.log(`💳  Final invoice ${finalInvoice.id} created and charged — ${newBalance}`);
+
+                } catch (finalErr) {
+                  console.error(`❌  Failed to create final invoice:`, finalErr.message);
+                  // Subscription is already cancelled at this point.
+                  // The player will need to pay the remaining balance manually.
                 }
               }
             }
@@ -1514,19 +1565,26 @@ app.post('/api/checkout', async (req, res) => {
 
       console.log(`📅  Installment checkout — deadline=${financials.payment_deadline} months=${months} balance=$${balanceToSplit} per-month=$${(perMonthCents/100).toFixed(2)}`);
 
-      // ── Find existing price for this exact amount, or create one ──
-      // This means all players registering in the same month share the
-      // same price object — no duplicate prices in Stripe.
+      // ── Find existing price for this exact amount AND month count ──────
+      // We match on BOTH unit_amount AND months metadata to avoid reusing a
+      // price from a previous deadline/registration that happens to have the
+      // same dollar amount but a different number of installments.
+      // e.g. $500/mo over 2 months vs $500/mo over 4 months are different plans
+      // even though the Stripe price amount is identical.
       const existingPrices = await stripe.prices.list({
         product: productId,
         active:  true,
         limit:   100,
       });
 
-      let installmentPrice = existingPrices.data.find(p => p.unit_amount === perMonthCents);
+      let installmentPrice = existingPrices.data.find(p =>
+        p.unit_amount === perMonthCents &&
+        p.metadata?.months === String(months) &&
+        p.metadata?.paymentDeadline === financials.payment_deadline
+      );
 
       if (installmentPrice) {
-        console.log(`♻️  Reusing existing Stripe price ${installmentPrice.id} ($${perMonthCents/100}/mo) for product ${productId}`);
+        console.log(`♻️  Reusing existing Stripe price ${installmentPrice.id} (${perMonthCents/100}/mo × ${months} months) for product ${productId}`);
       } else {
         installmentPrice = await stripe.prices.create({
           product:     productId,
@@ -1539,7 +1597,7 @@ app.post('/api/checkout', async (req, res) => {
             balanceToSplit:  String(balanceToSplit),
           },
         });
-        console.log(`💰  New Stripe price created ${installmentPrice.id} ($${perMonthCents/100}/mo × ${months} months) for product ${productId}`);
+        console.log(`💰  New Stripe price created ${installmentPrice.id} (${perMonthCents/100}/mo × ${months} months deadline=${financials.payment_deadline}) for product ${productId}`);
       }
 
       // ── cancel_at = deadline date (Stripe auto-cancels the subscription) ──
