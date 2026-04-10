@@ -1332,19 +1332,37 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
 
 /**
  * Returns the number of whole calendar months from today up to and including
- * the deadline month.  e.g. today = June, deadline = September → 4 (Jun/Jul/Aug/Sep).
+ * the deadline month, accounting for the day the player registered (charge day).
+ *
+ * chargeDay = day of month the player registered (Stripe bills on this day each month).
+ * If the charge day in the deadline month falls AFTER the deadline date, that month's
+ * charge will never fire before cancel_at kicks in — so we exclude it.
+ *
+ * Example: registered April 16, deadline October 15
+ *   → October charge fires Oct 16, which is after Oct 15 deadline → excluded
+ *   → 6 months counted (Apr, May, Jun, Jul, Aug, Sep)
+ *
  * Always returns at least 1.
  */
-function monthsRemainingUntilDeadline(deadlineStr) {
+function monthsRemainingUntilDeadline(deadlineStr, chargeDay) {
   if (!deadlineStr) return 1;
   const now      = new Date();
   const deadline = new Date(deadlineStr);
   if (isNaN(deadline)) return 1;
 
-  // Compare year+month only — we want full calendar months inclusive of today's month
-  const nowMonth      = now.getFullYear() * 12      + now.getMonth();
+  const nowMonth      = now.getFullYear() * 12 + now.getMonth();
   const deadlineMonth = deadline.getFullYear() * 12 + deadline.getMonth();
-  return Math.max(1, deadlineMonth - nowMonth + 1);
+
+  let months = deadlineMonth - nowMonth + 1;
+
+  // If Stripe would charge later in the month than the deadline date,
+  // that last charge is blocked by cancel_at — do not count it
+  const day = chargeDay || now.getDate();
+  if (day > deadline.getDate()) {
+    months = months - 1;
+  }
+
+  return Math.max(1, months);
 }
 
 // GET /api/teams/:id/installment-preview
@@ -1361,7 +1379,8 @@ app.get('/api/teams/:id/installment-preview', async (req, res) => {
     const deposit    = financials.deposit_amount || 0;
     const depEnabled = financials.deposit_enabled || false;
     const balance    = depEnabled ? Math.max(0, fee - deposit) : fee;
-    const months     = monthsRemainingUntilDeadline(financials.payment_deadline);
+    const chargeDay  = new Date().getDate();
+    const months     = monthsRemainingUntilDeadline(financials.payment_deadline, chargeDay);
     const perMonth   = months > 0 ? Math.round((balance / months) * 100) / 100 : balance;
 
     res.json({
@@ -1426,7 +1445,8 @@ app.post('/api/checkout', async (req, res) => {
         return res.status(400).json({ message: 'No balance remaining to split into installments.' });
       }
 
-      const months        = monthsRemainingUntilDeadline(financials.payment_deadline);
+      const chargeDay     = new Date().getDate();
+      const months        = monthsRemainingUntilDeadline(financials.payment_deadline, chargeDay);
       const perMonthCents = Math.round((balanceToSplit / months) * 100);
 
       console.log(`📅  Installment checkout — deadline=${financials.payment_deadline} months=${months} balance=$${balanceToSplit} per-month=$${(perMonthCents/100).toFixed(2)}`);
