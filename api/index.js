@@ -1119,8 +1119,17 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
           deleteStripeProduct(existing.stripe_product_full),
           deleteStripeProduct(existing.stripe_product_deposit),
           deleteStripeProduct(existing.stripe_product_remainder),
-          deleteStripeProduct(existing.stripe_product_installment),
+          // For installment: archive all existing prices under the product
+          // (new prices will be created at next checkout) but keep the product itself
+          existing.stripe_product_installment
+            ? stripe.prices.list({ product: existing.stripe_product_installment, active: true, limit: 100 })
+                .then(r => Promise.all(r.data.map(p => stripe.prices.update(p.id, { active: false }))))
+                .catch(() => {})
+            : Promise.resolve(),
         ]);
+        // Carry the installment product ID forward — no need to recreate it
+        update.stripe_product_installment = existing.stripe_product_installment || '';
+        update.stripe_price_installment   = '';
       }
 
       // ── Full pay product (ONLY when deposit is OFF) ───────
@@ -1179,17 +1188,24 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       }
 
       // ── Monthly installment product ───────────────────────
-      if (monthlyPayments && installment > 0) {
+      // We create ONE Stripe product at setup time as a container.
+      // Prices are created dynamically per-player at checkout (one price
+      // per unique monthly amount, shared by all players registering in
+      // the same month). The subscription auto-cancels at payment_deadline
+      // via cancel_at so players are never overbilled.
+      if (monthlyPayments) {
         if (!update.stripe_product_installment) {
-          const { productId, priceId } = await createStripeProductWithPrice(
-            `${teamLabel} – Monthly Installment ($${installment}/mo × ${months})`,
-            installment,
-            { interval: 'month', intervalCount: 1 }
-          );
-          update.stripe_product_installment = productId;
-          update.stripe_price_installment   = priceId;
+          // Create just the product — no price yet
+          const product = await stripe.products.create({
+            name: `${teamLabel} – Monthly Installment`,
+            metadata: { coachId: String(req.coachId), teamLabel },
+          });
+          update.stripe_product_installment = product.id;
+          update.stripe_price_installment   = ''; // prices created per-player at checkout
+          console.log(`📦  Stripe installment product created: ${product.id}`);
         }
       } else {
+        // Monthly payments toggled OFF — archive the product and all its prices
         if (existing?.stripe_product_installment && !feeChanged) {
           await deleteStripeProduct(existing.stripe_product_installment);
         }
@@ -1220,6 +1236,56 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
 // POST /api/checkout
 // Body: { coachId, paymentType, playerPaymentId, successUrl, cancelUrl }
 // paymentType: 'full' | 'deposit' | 'remainder' | 'installment'
+
+/**
+ * Returns the number of whole calendar months from today up to and including
+ * the deadline month.  e.g. today = June, deadline = September → 4 (Jun/Jul/Aug/Sep).
+ * Always returns at least 1.
+ */
+function monthsRemainingUntilDeadline(deadlineStr) {
+  if (!deadlineStr) return 1;
+  const now      = new Date();
+  const deadline = new Date(deadlineStr);
+  if (isNaN(deadline)) return 1;
+
+  // Compare year+month only — we want full calendar months inclusive of today's month
+  const nowMonth      = now.getFullYear() * 12      + now.getMonth();
+  const deadlineMonth = deadline.getFullYear() * 12 + deadline.getMonth();
+  return Math.max(1, deadlineMonth - nowMonth + 1);
+}
+
+// GET /api/teams/:id/installment-preview
+// Public — returns the dynamic per-month amount for a player registering today.
+// Used by team.html to show the correct payment plan before checkout.
+app.get('/api/teams/:id/installment-preview', async (req, res) => {
+  try {
+    const financials = await TeamFinancials.findOne({ coach_id: req.params.id });
+    if (!financials || !financials.monthly_payments) {
+      return res.json({ enabled: false });
+    }
+
+    const fee        = financials.player_fee     || 0;
+    const deposit    = financials.deposit_amount || 0;
+    const depEnabled = financials.deposit_enabled || false;
+    const balance    = depEnabled ? Math.max(0, fee - deposit) : fee;
+    const months     = monthsRemainingUntilDeadline(financials.payment_deadline);
+    const perMonth   = months > 0 ? Math.round((balance / months) * 100) / 100 : balance;
+
+    res.json({
+      enabled:         true,
+      months,
+      perMonth,
+      balance,
+      totalFee:        fee,
+      depositEnabled:  depEnabled,
+      depositAmount:   deposit,
+      paymentDeadline: financials.payment_deadline || '',
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 app.post('/api/checkout', async (req, res) => {
   if (!stripe) return res.status(500).json({ message: 'Stripe is not configured on the server' });
 
@@ -1233,39 +1299,119 @@ app.post('/api/checkout', async (req, res) => {
     const financials = await TeamFinancials.findOne({ coach_id: coachId });
     if (!financials) return res.status(404).json({ message: 'Team financials not found' });
 
-    // ── Map paymentType → stored Stripe price ID ──────────────
-    const priceIdMap = {
-      full:        financials.stripe_price_full,
-      deposit:     financials.stripe_price_deposit,
-      remainder:   financials.stripe_price_remainder,
-      installment: financials.stripe_price_installment,
-    };
+    const coach = await Coach.findById(coachId).select('team_name');
+    const teamLabel = coach?.team_name || 'Team';
 
-    const priceId = priceIdMap[paymentType];
-    if (!priceId) {
-      return res.status(404).json({
-        message: `No Stripe price found for paymentType "${paymentType}". Please re-save your financial setup to generate Stripe products.`,
+    // ── Build checkout session ────────────────────────────────
+    let lineItems;
+    let mode;
+
+    if (paymentType === 'installment') {
+      // ── DYNAMIC installment: calculate months remaining for this player ──
+      if (!financials.monthly_payments) {
+        return res.status(400).json({ message: 'Monthly payments are not enabled for this team.' });
+      }
+
+      const productId = financials.stripe_product_installment;
+      if (!productId) {
+        return res.status(404).json({
+          message: 'No installment product found. Please re-save your financial setup.',
+        });
+      }
+
+      if (!financials.payment_deadline) {
+        return res.status(400).json({ message: 'No payment deadline set. Coach must set a deadline first.' });
+      }
+
+      const fee          = financials.player_fee      || 0;
+      const deposit      = financials.deposit_amount  || 0;
+      const depEnabled   = financials.deposit_enabled || false;
+
+      // Balance to split = full fee, or fee minus deposit if deposit is enabled
+      const balanceToSplit = depEnabled ? Math.max(0, fee - deposit) : fee;
+      if (balanceToSplit <= 0) {
+        return res.status(400).json({ message: 'No balance remaining to split into installments.' });
+      }
+
+      const months        = monthsRemainingUntilDeadline(financials.payment_deadline);
+      const perMonthCents = Math.round((balanceToSplit / months) * 100);
+
+      console.log(`📅  Installment checkout — deadline=${financials.payment_deadline} months=${months} balance=$${balanceToSplit} per-month=$${(perMonthCents/100).toFixed(2)}`);
+
+      // ── Find existing price for this exact amount, or create one ──
+      // This means all players registering in the same month share the
+      // same price object — no duplicate prices in Stripe.
+      const existingPrices = await stripe.prices.list({
+        product: productId,
+        active:  true,
+        limit:   100,
       });
-    }
 
-    // ── Verify the price is still active in Stripe ────────────
-    let price;
-    try {
-      price = await stripe.prices.retrieve(priceId);
-    } catch (err) {
-      return res.status(404).json({ message: `Stripe price ${priceId} not found: ${err.message}` });
-    }
+      let installmentPrice = existingPrices.data.find(p => p.unit_amount === perMonthCents);
 
-    if (!price.active) {
-      return res.status(400).json({
-        message: `Stripe price ${priceId} is inactive. Please re-save your financial setup to regenerate Stripe products.`,
-      });
+      if (installmentPrice) {
+        console.log(`♻️  Reusing existing Stripe price ${installmentPrice.id} ($${perMonthCents/100}/mo) for product ${productId}`);
+      } else {
+        installmentPrice = await stripe.prices.create({
+          product:     productId,
+          unit_amount: perMonthCents,
+          currency:    'usd',
+          recurring:   { interval: 'month', interval_count: 1 },
+          metadata:    {
+            months:          String(months),
+            paymentDeadline: financials.payment_deadline,
+            balanceToSplit:  String(balanceToSplit),
+          },
+        });
+        console.log(`💰  New Stripe price created ${installmentPrice.id} ($${perMonthCents/100}/mo × ${months} months) for product ${productId}`);
+      }
+
+      // ── cancel_at = deadline date (Stripe auto-cancels the subscription) ──
+      const cancelAtTimestamp = Math.floor(new Date(financials.payment_deadline) / 1000);
+
+      mode      = 'subscription';
+      lineItems = [{ price: installmentPrice.id, quantity: 1 }];
+
+      // Store cancel_at for use in session creation below
+      req._installmentCancelAt = cancelAtTimestamp;
+
+    } else {
+      // ── Static payment types: full | deposit | remainder ──────
+      const priceIdMap = {
+        full:      financials.stripe_price_full,
+        deposit:   financials.stripe_price_deposit,
+        remainder: financials.stripe_price_remainder,
+      };
+
+      const priceId = priceIdMap[paymentType];
+      if (!priceId) {
+        return res.status(404).json({
+          message: `No Stripe price found for paymentType "${paymentType}". Please re-save your financial setup to generate Stripe products.`,
+        });
+      }
+
+      // Verify the price is still active in Stripe
+      let price;
+      try {
+        price = await stripe.prices.retrieve(priceId);
+      } catch (err) {
+        return res.status(404).json({ message: `Stripe price ${priceId} not found: ${err.message}` });
+      }
+
+      if (!price.active) {
+        return res.status(400).json({
+          message: `Stripe price ${priceId} is inactive. Please re-save your financial setup to regenerate Stripe products.`,
+        });
+      }
+
+      mode      = 'payment';
+      lineItems = [{ price: priceId, quantity: 1 }];
     }
 
     // ── Create checkout session ───────────────────────────────
-    const session = await stripe.checkout.sessions.create({
-      mode:       paymentType === 'installment' ? 'subscription' : 'payment',
-      line_items: [{ price: priceId, quantity: 1 }],
+    const sessionParams = {
+      mode,
+      line_items: lineItems,
       success_url: successUrl || `${req.headers.origin || 'https://yoursite.com'}?payment=success`,
       cancel_url:  cancelUrl  || `${req.headers.origin || 'https://yoursite.com'}?payment=cancelled`,
       metadata: {
@@ -1273,9 +1419,23 @@ app.post('/api/checkout', async (req, res) => {
         paymentType,
         coachId,
       },
-    });
+    };
 
-    console.log(`🛒  Stripe checkout created — type=${paymentType} priceId=${priceId} session=${session.id}`);
+    // For installments: auto-cancel the subscription at the payment deadline
+    if (paymentType === 'installment' && req._installmentCancelAt) {
+      sessionParams.subscription_data = {
+        cancel_at: req._installmentCancelAt,
+        metadata: {
+          playerPaymentId,
+          paymentType,
+          coachId,
+        },
+      };
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+
+    console.log(`🛒  Stripe checkout created — type=${paymentType} session=${session.id}`);
     res.json({ url: session.url });
 
   } catch (err) {
